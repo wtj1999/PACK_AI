@@ -1,0 +1,28 @@
+from connects.db_client import DBClient
+from fastapi import FastAPI
+from services.factory import get_service_factory
+from services.temp_corr_service import register as register_temp, router as temp_router
+from core.config import get_settings
+from core.logging import setup_logging
+
+setup_logging()
+settings = get_settings()
+factory = get_service_factory()
+
+service_kwargs = dict()
+
+app = FastAPI(title=settings.APP_NAME)
+app.include_router(temp_router, prefix="/temp", tags=["temp"])
+
+
+@app.on_event("startup")
+async def startup():
+    app.state.db_client = DBClient()
+    register_temp(factory, settings=settings, db_client=app.state.db_client, **service_kwargs)
+
+    await factory.startup_all()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await factory.shutdown_all()

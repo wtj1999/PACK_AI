@@ -1,0 +1,27 @@
+variables:
+  GIT_DEPTH: 0              # 完全禁用浅克隆
+  GIT_STRATEGY: clone       # 强制每次都完整克隆
+
+stages:
+  - scan
+  - test
+
+before_script:
+  - source /data/software/anaconda3/bin/activate
+  - conda activate ai_pack
+
+prepare:
+  stage: scan
+  tags:
+    - scan
+  script:
+    - flake8
+  retry: 2
+
+test:
+  stage: test
+  tags:
+    - test
+  script:
+    - python -m unittest discover
+  retry: 2

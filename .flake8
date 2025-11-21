@@ -1,0 +1,4 @@
+[flake8]
+max-line-length = 130
+ignore = E722 W503 W291 W293
+exclude = *config*
