@@ -68,7 +68,6 @@ class EnvUtil(object):
     def is_test_env(env: str) -> bool:
         return env == Env.TEST.value
 
-    # TODO
     @staticmethod
     def is_on_cloud() -> bool:
         return False

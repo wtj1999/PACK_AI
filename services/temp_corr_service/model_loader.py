@@ -10,7 +10,7 @@ class ModelHolder:
         self._model = None
 
     def load(self, path: str):
-        # TODO: 实现你的模型加载逻辑
+        # 实现你的模型加载逻辑
         # 示例: self._model = some_loader(path)
         self._model = {"path": path}
         return self._model
