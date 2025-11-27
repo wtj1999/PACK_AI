@@ -26,6 +26,7 @@ COPY . /app
 EXPOSE 8000
 
 RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN touch /app/ai_pack_server.log && chown appuser:appuser /app/ai_pack_server.log
 USER appuser
 
 CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:8000", "--workers", "4", "--timeout", "120"]
