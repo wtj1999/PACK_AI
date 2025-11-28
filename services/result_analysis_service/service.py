@@ -1,6 +1,5 @@
 from typing import Dict, List, Any
 import pandas as pd
-import numpy as np
 from sqlalchemy import text
 from services.base import BaseService
 from fastapi import HTTPException
@@ -65,6 +64,5 @@ class ResultService(BaseService):
                 "resultDataList": volt_dict
             }
             result_list.append(_result)
-
 
         return result_list
