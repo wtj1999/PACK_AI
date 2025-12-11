@@ -46,6 +46,30 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
     LOG_FILE: Optional[str] = Field("ai_pack_server.log", env="LOG_FILE")
 
+    PACK_CONFIG = {
+        "CELLS_PER_PHYSICAL_PACK": 102,
+    }
+
+    MODEL_CONFIG = {
+        "model_name": 'Transformer',
+        "input_feature": ['capacity', 'ocv3', 'ocv4', 'acr3', 'acr4', 'k_value', 'cell_thickness', 'weight']
+                              + [f'step_{i}_volt' for i in range(1, 9)],
+        "target_idxs": ['0', '5', '6'],
+        "out_dim": 1,
+        "node_dim": 102,
+        "model_store_dir": 'services/result_analysis_service/model_store',
+        "DeepSet": {
+            "emb_dim": 128
+        },
+        "Transformer": {
+            "model_dim": 128,
+            "num_layers": 6,
+            "num_heads": 4,
+            "use_pack_token": False
+        },
+
+    }
+
     DB_CONFIG: Dict[str, TenantDBConfig] = Field(
         {
             "jz2_pack": {
