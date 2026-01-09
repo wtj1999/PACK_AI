@@ -64,7 +64,7 @@ def dtw_distance(a: np.ndarray,
             cost = dist_func(a[i-1], b[j-1])
             # transitions: (i-1,j), (i,j-1), (i-1,j-1)
             D[i,j] = cost + min(D[i-1, j],    # insertion
-                                 D[i,   j-1],  # deletion
+                                 D[i, j-1],  # deletion
                                  D[i-1, j-1])  # match
 
     dtw_dist = float(D[n, m])

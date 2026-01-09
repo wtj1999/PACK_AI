@@ -18,7 +18,7 @@ class DcrService(BaseService):
         self._ready = False
         self.table = 'jz2_pack_result_data'
         self.table1 = 'jz2_pack_cell_data'
-        self.step_id = '15'
+        self.step_id = '1'
 
     async def startup(self) -> None:
         self._ready = True

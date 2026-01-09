@@ -12,3 +12,7 @@ typing-inspection==0.4.0
 PyMySQL==1.1.1
 dotenv==0.9.9
 python-dotenv==1.2.1
+#torch==2.7.1
+#torchvision==0.22.1
+#torchaudio==2.7.1
+joblib==1.5.1

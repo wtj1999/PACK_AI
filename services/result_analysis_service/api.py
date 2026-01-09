@@ -113,4 +113,3 @@ def pack_result_predict(payload: PackQuery, factory: ServiceFactory = Depends(_g
     )
 
     return PackPredictionsResponse(**res)
-

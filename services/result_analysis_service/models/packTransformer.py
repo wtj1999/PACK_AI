@@ -30,7 +30,7 @@ class RelativePositionBias(nn.Module):
         dist = (q_idx - k_idx).abs().clamp(max=self.max_rel).long()  # (qlen, klen)
         # bias_table: (num_heads, max_rel+1) -> index by dist to (num_heads, qlen, klen)
         bias = self.bias_table[:, dist]  # (num_heads, qlen, klen)
-        return bias  # to be added to attention logits per head
+        return bias
 
 
 class MultiHeadSelfAttentionWithRelBias(nn.Module):
@@ -153,7 +153,7 @@ class PackTransformer(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # output head (from pack token if used, else pooled mean)
+        # output head
         if use_pack_token:
             self.head = nn.Sequential(
                 nn.LayerNorm(model_dim),
@@ -189,10 +189,8 @@ class PackTransformer(nn.Module):
             h = torch.cat([pack_tok, h], dim=1)  # (B, 1+n, D)
         L = h.shape[1]  # L = n + 1 if pack token
 
-        # add pos emb (absolute for stability) - we still have relative bias in attention
         h = h + self.pos_embed[:, :L, :]
 
-        # optionally build attn_mask to disallow pack token attending to nothing? we allow full attention
         for layer in self.layers:
             h = layer(h, attn_mask=attn_mask)
 

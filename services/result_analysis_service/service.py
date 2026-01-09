@@ -1,13 +1,11 @@
 import logging
 import torch
-import os
-import joblib
-import torch.nn as nn
 import pandas as pd
+import numpy as np
 from sqlalchemy import text
 from services.base import BaseService
 from fastapi import HTTPException
-from .util import DataValidator, PackFrameBuilder
+from .util import DataValidator, PackFrameBuilder, build_pack_features
 from .model_loader import ModelHolder
 from typing import Dict, List, Any
 
@@ -50,8 +48,8 @@ class ResultService(BaseService):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"数据库查询失败: {e}")
 
-        if len(df) < 5:
-            raise HTTPException(status_code=404, detail="数据库中结果数据不完整")
+        # if len(df) < 5:
+        #     raise HTTPException(status_code=404, detail="数据库中结果数据不完整")
 
         volt_cols = [c for c in df.columns if c and c.startswith("bms_cellvolt")]
         stepName_list = ['测前电压', '充电末端动态电压', '充电后静态电压', '放电末端动态电压', '放电后静态电压']
@@ -59,19 +57,26 @@ class ResultService(BaseService):
         result_list = []
 
         for i, id in enumerate(['1', '8', '9', '14', '15']):
-            volt_data = df[df['step_id'] == id][volt_cols].iloc[0].values
-            volt_df = pd.DataFrame({
-                'cell_index': range(1, len(volt_cols) + 1),
-                'cell_volt': volt_data
-            })
-            volt_df = pd.merge(volt_df, cell_map_df, how='left', left_on='cell_index', right_on='cell_index')
-            vals = volt_df.sort_values(['module_in_pack', 'cell_in_module'])['cell_volt'].values
-            volt_dict = {f"bmsCellvolt{i + 1}": round(vals[i], 3) for i in range(102)}
-            _result = {
-                "stepId": id,
-                "stepName": stepName_list[i],
-                "resultDataList": volt_dict
-            }
+            if df[df['step_id'] == id].empty:
+                _result = {
+                    "stepId": id,
+                    "stepName": stepName_list[i],
+                    "resultDataList": {f"bmsCellvolt{i + 1}": 0.0 for i in range(102)}
+                }
+            else:
+                volt_data = df[df['step_id'] == id][volt_cols].iloc[0].values
+                volt_df = pd.DataFrame({
+                    'cell_index': range(1, len(volt_cols) + 1),
+                    'cell_volt': volt_data
+                })
+                volt_df = pd.merge(volt_df, cell_map_df, how='left', left_on='cell_index', right_on='cell_index')
+                vals = volt_df.sort_values(['module_in_pack', 'cell_in_module'])['cell_volt'].values
+                volt_dict = {f"bmsCellvolt{i + 1}": round(vals[i], 3) for i in range(102)}
+                _result = {
+                    "stepId": id,
+                    "stepName": stepName_list[i],
+                    "resultDataList": volt_dict
+                }
             result_list.append(_result)
 
         return result_list
@@ -94,8 +99,9 @@ class ResultPredictService(BaseService):
         self.input_feature_num = len(self.input_feature)
         self.cell_num = settings.PACK_CONFIG.get('CELLS_PER_PHYSICAL_PACK')
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.target_idxs = settings.MODEL_CONFIG.get('target_idxs', ['0', '5', '6'])
-        self.model_holder = ModelHolder(settings=settings, device=self.device, target_idxs=self.target_idxs)
+        self.target_name = settings.MODEL_CONFIG.get('target_name', ['Discharge_Dynamic_Voltage', 'Discharge_Static_Voltage'])
+        self.model_name = settings.MODEL_CONFIG.get('model_name', 'Catboost')
+        self.model_holder = ModelHolder(settings=settings, device=self.device, target_name=self.target_name)
 
 
     async def startup(self) -> None:
@@ -158,63 +164,143 @@ class ResultPredictService(BaseService):
                            how='inner')
 
         df = self.frame_builder.build_frames(cell_df, result_df)
-        input_df = df[self.input_feature]
-        if input_df.isnull().any().any():
-            raise HTTPException(status_code=404, detail="数据库中数据不完整,不进行预测任务")
+        return df
 
-        return input_df
+    def cal_diff_data(self, df):
+        diff_result = {}
+        if 'step_1_volt' in df.columns:
+            diff_result.update({
+                "测前压差": round(df['step_1_volt'].max() - df['step_1_volt'].min(), 3)
+            })
+        else:
+            diff_result.update({
+                "测前压差": 0
+            })
+        if 'step_8_volt' in df.columns:
+            diff_result.update({
+                "充电末端动态压差": round(df['step_8_volt'].max() - df['step_8_volt'].min(), 3)
+            })
+        else:
+            diff_result.update({
+                "充电末端静态压差": 0
+            })
+        if 'step_9_volt' in df.columns:
+            diff_result.update({
+                "充电后静态压差": round(df['step_9_volt'].max() - df['step_9_volt'].min(), 3)
+            })
+        else:
+            diff_result.update({
+                "充电后静态压差": 0
+            })
+        if 'step_14_volt' in df.columns:
+            diff_result.update({
+                "放电末端动态压差": round(df['step_14_volt'].max() - df['step_14_volt'].min(), 3)
+            })
+        else:
+            diff_result.update({
+                "放电末端动态压差": 0
+            })
+        if 'step_15_volt' in df.columns:
+            diff_result.update({
+                "放电后静态压差": round(df['step_15_volt'].max() - df['step_15_volt'].min(), 3)
+            })
+        else:
+            diff_result.update({
+                "放电后静态压差": 0
+            })
+
+        return diff_result
 
     def pack_result_predict(self, pack_code: str):
 
         input_df = self.fetch_input_data(pack_code)
-        input_vals = input_df.values
 
-        if input_vals.shape != (self.cell_num, self.input_feature_num):
-            raise HTTPException(status_code=500,
-                                detail=f"input shape mismatch, got {input_vals.shape}, expected ({self.cell_num},{self.input_feature_num})")
+        diff_result = self.cal_diff_data(input_df)
 
-        X_flat = input_vals.reshape(-1, self.input_feature_num)  # (cell_num, feature)
+        if input_df[self.input_feature].isnull().any().any():
+            diff_result.update({
+                "放电末端动态压差预测值": 0,
+                "放电后静态压差预测值": 0
+            })
+            return diff_result
 
-        results = {"pack_code": pack_code, "predictions": {}}
-
-        for target in self.target_idxs:
-            try:
-                model, model_dir = self.model_holder.load_model(target)
-                x_scaler, y_scaler, _ = self.model_holder.load_scalers(target)
-            except Exception as e:
-                results["predictions"][target] = {"error": str(e)}
-                continue
-
-            X_scaled_flat = x_scaler.transform(X_flat)  # (cell_num, feature)
-            X_scaled = X_scaled_flat.reshape(1, self.cell_num, self.input_feature_num)
-            X_tensor = torch.from_numpy(X_scaled).float().to(self.device)
-
-            with torch.no_grad():
-                model.to(self.device)
-                model.eval()
-                pred_np = model(X_tensor)  # (1, cell_num, out_dim)
-                if isinstance(pred_np, torch.Tensor):
-                    pred_np = pred_np.cpu().numpy()
-
-            out_dim = pred_np.shape[-1]
-            pred_flat = pred_np.reshape(-1, out_dim)
-            try:
-                pred_inv_flat = y_scaler.inverse_transform(pred_flat)
-            except Exception:
-                if pred_flat.shape[1] == 1:
-                    pred_inv_flat = y_scaler.inverse_transform(pred_flat)
-                else:
-                    pred_inv_flat = pred_flat
-
-            pred_final = pred_inv_flat.reshape(1, self.cell_num, -1)  # (1, cell_num, out_dim)
-            pred_list = pred_final.tolist()
-
-            results["predictions"][target] = {
-                "pred": pred_list,
-                "model_dir": model_dir
+        if self.model_name == 'Catboost':
+            target_name_map = {
+                'Discharge_Dynamic_Voltage': '放电末端动态压差预测值',
+                'Discharge_Static_Voltage': '放电后静态压差预测值'
             }
+            input_tree_df = build_pack_features(
+                input_df,
+                group_col='pack_code',
+                numeric_cols=None,
+                step_range_for_inputs=range(1, 10),
+                stats=['mean', 'std', 'min', 'max', 'median', 'q25', 'q75', 'range'],
+                include_counts=True
+            )
+            numeric_cols = input_tree_df.select_dtypes(include=[np.number]).columns.tolist()
+            for target in self.target_name:
+                try:
+                    model, model_dir = self.model_holder.load_model(target)
+                except Exception as e:
+                    diff_result.update({
+                        f"{target_name_map[target]}": 0
+                    })
+                    continue
 
-        return results
+                y_pred = model.predict(input_tree_df[numeric_cols])
+                diff_result.update({
+                    f"{target_name_map[target]}": round(y_pred[0], 3)
+                })
+
+        else:
+            input_vals = input_df.values
+
+            if input_vals.shape != (self.cell_num, self.input_feature_num):
+                raise HTTPException(status_code=500,
+                                    detail=f"input shape mismatch, got {input_vals.shape}, expected ({self.cell_num},{self.input_feature_num})")
+
+            X_flat = input_vals.reshape(-1, self.input_feature_num)  # (cell_num, feature)
+
+            results = {"pack_code": pack_code, "predictions": {}}
+
+            for target in self.target_idxs:
+                try:
+                    model, model_dir = self.model_holder.load_model(target)
+                    x_scaler, y_scaler, _ = self.model_holder.load_scalers(target)
+                except Exception as e:
+                    results["predictions"][target] = {"error": str(e)}
+                    continue
+
+                X_scaled_flat = x_scaler.transform(X_flat)  # (cell_num, feature)
+                X_scaled = X_scaled_flat.reshape(1, self.cell_num, self.input_feature_num)
+                X_tensor = torch.from_numpy(X_scaled).float().to(self.device)
+
+                with torch.no_grad():
+                    model.to(self.device)
+                    model.eval()
+                    pred_np = model(X_tensor)  # (1, cell_num, out_dim)
+                    if isinstance(pred_np, torch.Tensor):
+                        pred_np = pred_np.cpu().numpy()
+
+                out_dim = pred_np.shape[-1]
+                pred_flat = pred_np.reshape(-1, out_dim)
+                try:
+                    pred_inv_flat = y_scaler.inverse_transform(pred_flat)
+                except Exception:
+                    if pred_flat.shape[1] == 1:
+                        pred_inv_flat = y_scaler.inverse_transform(pred_flat)
+                    else:
+                        pred_inv_flat = pred_flat
+
+                pred_final = pred_inv_flat.reshape(1, self.cell_num, -1)  # (1, cell_num, out_dim)
+                pred_list = pred_final.tolist()
+
+                results["predictions"][target] = {
+                    "pred": pred_list,
+                    "model_dir": model_dir
+                }
+
+        return diff_result
 
 
 

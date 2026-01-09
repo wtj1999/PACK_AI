@@ -29,3 +29,4 @@ class PredictionItem(BaseModel):
 class PackPredictionsResponse(BaseModel):
     pack_code: str = Field(..., description="PACK编号")
     predictions: Dict[str, PredictionItem] = Field(..., description="预测结果")
+    测前压差: Optional[float] = Field(None, description="测前压差")

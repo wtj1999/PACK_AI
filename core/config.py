@@ -51,10 +51,10 @@ class Settings(BaseSettings):
     }
 
     MODEL_CONFIG = {
-        "model_name": 'Transformer',
+        "model_name": 'Catboost',
         "input_feature": ['capacity', 'ocv3', 'ocv4', 'acr3', 'acr4', 'k_value', 'cell_thickness', 'weight']
-                              + [f'step_{i}_volt' for i in range(1, 9)],
-        "target_idxs": ['0', '5', '6'],
+                              + [f'step_{i}_volt' for i in range(1, 10)],
+        "target_name": ['Discharge_Dynamic_Voltage', 'Discharge_Static_Voltage'],
         "out_dim": 1,
         "node_dim": 102,
         "model_store_dir": 'services/result_analysis_service/model_store',
@@ -67,6 +67,15 @@ class Settings(BaseSettings):
             "num_heads": 4,
             "use_pack_token": False
         },
+        "Catboost": {
+            'iterations': 50000,
+            'learning_rate': 0.01,
+            'depth': 4,
+            'loss_function': 'RMSE',
+            'early_stopping_rounds': 1000,
+            'random_seed': 42,
+            'verbose': 100,
+        }
 
     }
 

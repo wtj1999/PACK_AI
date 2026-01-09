@@ -8,6 +8,7 @@ import joblib
 from typing import List, Optional
 from .models.deepset import DeepSetModel
 from .models.packTransformer import PackTransformer
+from catboost import CatBoostRegressor
 
 
 # class ModelHolder:
@@ -52,31 +53,33 @@ from .models.packTransformer import PackTransformer
 #     def unload_model(self):
 #         self._model = None
 class ModelHolder:
-    def __init__(self, settings=None, device='cpu', target_idxs: Optional[List[str]] = None):
+    def __init__(self, settings=None, device='cpu', target_name: Optional[List[str]] = None):
         """
         settings: 应包含 MODEL_CONFIG 字段
         device: 'cpu' or 'cuda'
-        target_idxs: list of target id strings, e.g. ['0','5','6']
         """
         self.model_name = settings.MODEL_CONFIG.get('model_name')
         self.device = device
         self.model_cfg = settings.MODEL_CONFIG
         self.model_dir_root = self.model_cfg.get('model_store_dir')
-        self.target_idxs = target_idxs or self.model_cfg.get('target_idxs', ['5'])
+        self.target_name = target_name or self.model_cfg.get('target_name')
 
     def _build_model_instance(self):
 
-        in_dim = len(self.model_cfg.get('input_feature'))
-        out_dim = self.model_cfg.get('out_dim')
-        node_dim = self.model_cfg.get('node_dim')
-
         if self.model_name == 'DeepSet':
+            in_dim = len(self.model_cfg.get('input_feature'))
+            out_dim = self.model_cfg.get('out_dim')
+            node_dim = self.model_cfg.get('node_dim')
             model = DeepSetModel(in_dim=in_dim,
                                  emb_dim=self.model_cfg.get(self.model_name)['emb_dim'],
                                  node_dim=node_dim,
                                  out_dim=out_dim).to(self.device)
+            return model
 
         elif self.model_name == 'Transformer':
+            in_dim = len(self.model_cfg.get('input_feature'))
+            out_dim = self.model_cfg.get('out_dim')
+            node_dim = self.model_cfg.get('node_dim')
             model = PackTransformer(in_dim=in_dim,
                                     model_dim=self.model_cfg.get(self.model_name)['model_dim'],
                                     num_layers=self.model_cfg.get(self.model_name)['num_layers'],
@@ -86,27 +89,40 @@ class ModelHolder:
                                     max_rel=self.model_cfg.get(self.model_name).get('max_rel', 51),
                                     use_pack_token=self.model_cfg.get(self.model_name).get('use_pack_token', False)
                                     ).to(self.device)
+            return model
+
+        elif self.model_name == 'Catboost':
+            model = CatBoostRegressor()
+            return model
+
         else:
             raise ValueError(f"Unknown model_name {self.model_name}")
         return model
 
-    def _model_dir_for(self, target_idx: str) -> str:
-        return os.path.join(self.model_dir_root, f"{self.model_name}_target{target_idx}")
+    def _model_dir_for(self, target_name: str) -> str:
+        return os.path.join(self.model_dir_root, f"{self.model_name}_target_{target_name}")
 
-    def load_model(self, target_idx: str):
+    def load_model(self, target_name: str):
         """
         返回 (model_instance, model_dir) —— model 已 load_state_dict 并放到 self.device
         每次调用会创建新的 model instance 并加载对应 target 的权重文件。
         """
         model = self._build_model_instance()
-        model_dir = self._model_dir_for(target_idx)
-        state_path = os.path.join(model_dir, f"{self.model_name}_best_target{target_idx}.pth")
-        if not os.path.exists(state_path):
-            raise FileNotFoundError(f"Model weights not found for target {target_idx}: {state_path}")
-        state = torch.load(state_path, map_location=self.device)
-        model.load_state_dict(state)
-        model.to(self.device)
-        model.eval()
+        model_dir = self._model_dir_for(target_name)
+
+        if self.model_name == 'Catboost':
+            state_path = os.path.join(model_dir, f"{self.model_name}_best_target_{target_name}.cbm")
+            if not os.path.exists(state_path):
+                raise FileNotFoundError(f"Model weights not found for target {target_name}: {state_path}")
+            model.load_model(state_path)
+        else:
+            state_path = os.path.join(model_dir, f"{self.model_name}_best_target_{target_name}.pth")
+            if not os.path.exists(state_path):
+                raise FileNotFoundError(f"Model weights not found for target {target_name}: {state_path}")
+            state = torch.load(state_path, map_location=self.device)
+            model.load_state_dict(state)
+            model.to(self.device)
+            model.eval()
         return model, model_dir
 
     def load_scalers(self, target_idx: str):

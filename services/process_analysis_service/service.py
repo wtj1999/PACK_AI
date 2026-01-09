@@ -1,11 +1,14 @@
 from typing import Dict, Any, List, Tuple
 import pandas as pd
 import numpy as np
+import logging
 from sqlalchemy import text
 from services.base import BaseService
 from fastapi import HTTPException
 from typing import Optional
 from .util import dtw_distance, dtw_similarity
+
+logger = logging.getLogger(__name__)
 
 class ProcessService(BaseService):
     """
@@ -462,6 +465,324 @@ class ProcessService(BaseService):
         result.update({"timeseries": timeseries_json})
 
         return result
+
+
+
+class ProcessDisplayService(BaseService):
+
+    def __init__(self, db_client=None):
+        self.db_client = db_client
+        self._ready = False
+        self.table = 'jz2_pack_process_data'
+
+    async def startup(self) -> None:
+        self._ready = True
+
+    async def shutdown(self) -> None:
+        self._ready = False
+
+    def info(self) -> Dict[str, Any]:
+        return {"name": "ProcessDisplayService", "ready": self._ready}
+
+    def fetch_minute_downsampled_df(self, pack_codes: List[str]):
+        num_cols = [
+            "charge_energy", "discharge_energy",
+            "charge_capacity", "discharge_capacity"
+        ]
+        bat_temp_cols = [f"bms_batttemp{i}" for i in range(1, 9)]
+        cell_volt_cols = [f"bms_cellvolt{i}" for i in range(1, 103)]
+
+        placeholders = []
+        params = {}
+        for idx, pk in enumerate(pack_codes):
+            ph = f":p{idx}"
+            placeholders.append(ph)
+            params[f"p{idx}"] = pk
+        in_clause = ", ".join(placeholders)
+
+        minute_bucket_expr = "DATE_FORMAT(acquire_time, '%Y-%m-%d %H:%i:00')"
+
+        subq = f"""
+            SELECT pack_code, {minute_bucket_expr} AS minute_ts, MIN(acquire_time) AS min_acq
+            FROM `{self.table}`
+            WHERE pack_code IN ({in_clause})
+            """
+
+        subq += " GROUP BY pack_code, minute_ts"
+        sql = f"""
+            SELECT s.minute_ts,
+                   t.pack_code,
+                   t.vehicle_code,
+                   t.step_id,
+                   t.step_name,
+                   t.charge_energy,
+                   t.discharge_energy,
+                   t.charge_capacity,
+                   t.discharge_capacity,
+            """
+
+        for c in bat_temp_cols + cell_volt_cols:
+            sql += f"t.`{c}`,\n    "
+        sql = sql.rstrip(",\n    ") + f"""
+            FROM (
+                {subq}
+            ) s
+            JOIN `{self.table}` t
+              ON t.pack_code = s.pack_code
+             AND DATE_FORMAT(t.acquire_time, '%Y-%m-%d %H:%i:00') = s.minute_ts
+             AND t.acquire_time = s.min_acq
+            ORDER BY s.minute_ts ASC
+            """
+
+        try:
+            df = self.db_client.read_sql(text(sql), params=params)
+        except Exception as e:
+            logger.exception("DB query failed in fetch_minute_downsampled_df (min-per-minute join): %s", e)
+            raise HTTPException(status_code=500, detail=f"数据库查询失败: {e}")
+
+        if df is None or df.empty:
+            cols = ["vehicle_code", "acquire_time", "step_id", "step_name",
+                    "charge_energy", "discharge_energy", "charge_capacity", "discharge_capacity"]
+            for i, _ in enumerate(pack_codes, start=1):
+                cols += [f"{c}_p{i}" for c in (bat_temp_cols + cell_volt_cols)]
+            return pd.DataFrame(columns=cols)
+
+        if "minute_ts" not in df.columns:
+            raise HTTPException(status_code=500, detail="expected minute_ts in query result")
+        df = df.rename(columns={"minute_ts": "acquire_time"})
+        df["acquire_time"] = pd.to_datetime(df["acquire_time"])
+
+        for c in num_cols + bat_temp_cols + cell_volt_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        pack_dfs = {}
+        for pk in pack_codes:
+            pk_df = df[df["pack_code"] == pk].copy()
+            if pk_df.empty:
+                pack_dfs[pk] = None
+                continue
+            pk_df = pk_df.set_index("acquire_time").sort_index()
+            pack_dfs[pk] = pk_df
+
+        primary_pk = next((pk for pk in pack_codes if pack_dfs.get(pk) is not None), None)
+        if primary_pk is None:
+            raise HTTPException(status_code=404, detail="未查询到任何 pack 的过程数据")
+
+        primary_df = pack_dfs[primary_pk][["vehicle_code", "step_id", "step_name"] + num_cols].copy()
+        primary_df["vehicle_code"] = primary_df["vehicle_code"].astype(str)
+
+        all_times = pd.Index(sorted({t for pkd in pack_dfs.values() if pkd is not None for t in pkd.index}))
+
+        primary_df_reindexed = primary_df.reindex(all_times)
+
+        base_block = primary_df_reindexed[
+            ["vehicle_code", "step_id", "step_name", "charge_energy", "discharge_energy", "charge_capacity",
+             "discharge_capacity"]].copy()
+
+        dfs_to_concat = [base_block]
+
+        for idx, pk in enumerate(pack_codes, start=1):
+            pk_df = pack_dfs.get(pk)
+            suffix = f"_p{idx}"
+            cols = bat_temp_cols + cell_volt_cols
+
+            if pk_df is None:
+                nan_block = pd.DataFrame(index=all_times, columns=[f"{c}{suffix}" for c in cols], dtype=float)
+                dfs_to_concat.append(nan_block)
+                continue
+
+            pk_vals = pk_df.reindex(all_times)
+            existing = [c for c in cols if c in pk_vals.columns]
+            missing = [c for c in cols if c not in pk_vals.columns]
+
+            if existing:
+                df_existing = pk_vals[existing].astype(float, errors="ignore").copy()
+                df_existing.columns = [f"{c}{suffix}" for c in df_existing.columns]
+            else:
+                df_existing = pd.DataFrame(index=all_times)
+
+            if missing:
+                df_missing = pd.DataFrame(index=all_times, columns=[f"{c}{suffix}" for c in missing], dtype=float)
+            else:
+                df_missing = None
+
+            if df_missing is None:
+                pack_block = df_existing
+            elif df_existing.empty:
+                pack_block = df_missing
+            else:
+                pack_block = pd.concat([df_existing, df_missing], axis=1)
+
+            desired_order = [f"{c}{suffix}" for c in cols]
+            pack_block = pack_block.reindex(columns=desired_order)
+
+            dfs_to_concat.append(pack_block)
+
+        final_df = pd.concat(dfs_to_concat, axis=1)
+        final_df = final_df.reset_index().rename(columns={"index": "acquire_time"})
+
+        ordered_cols = ["vehicle_code", "acquire_time", "step_id", "step_name",
+                        "charge_energy", "discharge_energy", "charge_capacity", "discharge_capacity"]
+        for idx in range(1, len(pack_codes) + 1):
+            ordered_cols += [f"{c}_p{idx}" for c in (bat_temp_cols + cell_volt_cols)]
+
+        for c in ordered_cols:
+            if c not in final_df.columns:
+                final_df[c] = np.nan
+
+        final_df = final_df[ordered_cols]
+
+        final_df = final_df.copy()
+
+        return final_df
+
+    def _fmt_ts(self, t) -> Optional[str]:
+        if pd.isna(t):
+            return None
+        try:
+            return pd.Timestamp(t).isoformat()
+        except Exception:
+            return str(t)
+
+    def extract_step_ranges(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        if df is None or df.empty:
+            return []
+
+        if "acquire_time" not in df.columns:
+            raise ValueError("DataFrame must contain 'acquire_time' column")
+
+        try:
+            times = pd.to_datetime(df["acquire_time"])
+            df = df.copy()
+            df["acquire_time"] = times
+        except Exception:
+            df = df.copy()
+
+        mask_valid = ~(
+                df.get("step_id").isna() & df.get("step_name").isna()
+        )
+        df_valid = df[mask_valid]
+        if df_valid.empty:
+            return []
+
+        grouped = df_valid.groupby(["step_id", "step_name"], sort=False)
+
+        out = []
+        for (sid, sname), g in grouped:
+            start_ts = g["acquire_time"].min()
+            end_ts = g["acquire_time"].max()
+
+            sid_norm = sid
+            if pd.notna(sid):
+                try:
+                    if isinstance(sid, float) and sid.is_integer():
+                        sid_norm = int(sid)
+                except Exception:
+                    pass
+
+            sname_norm = None if pd.isna(sname) else str(sname)
+
+            out.append({
+                "step_id": None if pd.isna(sid_norm) else sid_norm,
+                "step_name": sname_norm,
+                "range": [self._fmt_ts(start_ts), self._fmt_ts(end_ts)]
+            })
+
+        out_sorted = sorted(out, key=lambda x: (x["range"][0] is None, x["range"][0]))
+        return out_sorted
+
+    def process_display(self, pack_codes):
+        df = self.fetch_minute_downsampled_df(pack_codes)
+
+        if df is None or df.empty:
+            return {
+                "voltage_series": [],
+                "temperature_series": [],
+                "charge_energy_list": [],
+                "discharge_energy_list": [],
+                "charge_capacity_list": [],
+                "discharge_capacity_list": [],
+                "volt_diff_list": [],
+                "time_list": [],
+            }
+
+        cell_cols = [c for c in df.columns if c.lower().startswith("bms_cellvolt")]
+        temp_cols = [c for c in df.columns if c.lower().startswith("bms_batttemp")]
+
+        if cell_cols:
+            df[cell_cols] = df[cell_cols].apply(pd.to_numeric, errors="coerce")
+        if temp_cols:
+            df[temp_cols] = df[temp_cols].apply(pd.to_numeric, errors="coerce")
+
+        if cell_cols:
+            volt_sum = df[cell_cols].sum(axis=1, skipna=True)
+            all_nan_mask = df[cell_cols].isna().all(axis=1)
+            volt_sum = volt_sum.where(~all_nan_mask, np.nan)
+        else:
+            volt_sum = pd.Series([np.nan] * len(df), index=df.index)
+
+        if temp_cols:
+            temp_min = df[temp_cols].min(axis=1, skipna=True)
+            alltemp_nan_mask = df[temp_cols].isna().all(axis=1)
+            temp_min = temp_min.where(~alltemp_nan_mask, np.nan)
+        else:
+            temp_min = pd.Series([np.nan] * len(df), index=df.index)
+
+        if cell_cols:
+            volt_max = df[cell_cols].max(axis=1, skipna=True)
+            volt_min = df[cell_cols].min(axis=1, skipna=True)
+            volt_diff = round(volt_max - volt_min, 3)
+            volt_diff = volt_diff.where(~all_nan_mask, np.nan)
+        else:
+            volt_diff = pd.Series([np.nan] * len(df), index=df.index)
+
+        def _col_to_list(col_name):
+            if col_name in df.columns:
+                s = pd.to_numeric(df[col_name], errors="coerce")
+                return [None if (x is np.nan or pd.isna(x)) else float(x) for x in s.tolist()]
+            else:
+                return [None] * len(df)
+
+        charge_energy_list = _col_to_list("charge_energy")
+        discharge_energy_list = _col_to_list("discharge_energy")
+        charge_capacity_list = _col_to_list("charge_capacity")
+        discharge_capacity_list = _col_to_list("discharge_capacity")
+
+        time_series = df.get("acquire_time")
+        time_list: List[Optional[str]]
+        if time_series is None:
+            time_list = [None] * len(df)
+        else:
+            if pd.api.types.is_datetime64_any_dtype(time_series):
+                time_list = [None if pd.isna(t) else pd.Timestamp(t).isoformat() for t in time_series.tolist()]
+            else:
+                time_list = [None if pd.isna(t) else str(t) for t in time_series.tolist()]
+
+        def series_to_list(s: pd.Series) -> List[Optional[float]]:
+            return [None if (x is np.nan or pd.isna(x)) else float(x) for x in s.tolist()]
+
+        voltage_series = series_to_list(volt_sum)
+        temperature_series = series_to_list(temp_min)
+        volt_diff_list = series_to_list(volt_diff)
+
+        result = {
+            "voltage_series": voltage_series,
+            "temperature_series": temperature_series,
+            "charge_energy_list": charge_energy_list,
+            "discharge_energy_list": discharge_energy_list,
+            "charge_capacity_list": charge_capacity_list,
+            "discharge_capacity_list": discharge_capacity_list,
+            "volt_diff_list": volt_diff_list,
+            "time_list": time_list,
+        }
+
+        result.update({'all_segments': self.extract_step_ranges(df)})
+
+        return result
+
+
+
 
 
 
