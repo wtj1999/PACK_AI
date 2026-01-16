@@ -14,7 +14,7 @@ def _get_factory() -> ServiceFactory:
     return get_service_factory()
 
 
-@router.post("/pack-result-analysis", response_model=List[PackResultResponse])
+@router.post("/pack-result-analysis", response_model=PackResultResponse)
 def pack_result_analysis(payload: PackQuery, factory: ServiceFactory = Depends(_get_factory)):
     try:
         logger.info("Received /result/pack-result-analysis request: %s", payload.dict())
@@ -62,7 +62,7 @@ def pack_result_analysis(payload: PackQuery, factory: ServiceFactory = Depends(_
         payload.pack_code, elapsed_ms, res_repr
     )
 
-    return res
+    return PackResultResponse(**res)
 
 @router.post("/pack-result-predict", response_model=PackPredictionsResponse)
 def pack_result_predict(payload: PackQuery, factory: ServiceFactory = Depends(_get_factory)):

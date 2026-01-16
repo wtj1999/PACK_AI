@@ -7,6 +7,9 @@ from services.base import BaseService
 from fastapi import HTTPException
 from typing import Optional
 from .util import dtw_distance, dtw_similarity
+import re
+from collections import defaultdict
+import difflib
 
 logger = logging.getLogger(__name__)
 
@@ -467,12 +470,12 @@ class ProcessService(BaseService):
         return result
 
 
-
 class ProcessDisplayService(BaseService):
 
-    def __init__(self, db_client=None):
+    def __init__(self, settings=None, db_client=None):
         self.db_client = db_client
         self._ready = False
+        self.test_process_map = settings.TEST_PROCESS_CONFIG
         self.table = 'jz2_pack_process_data'
 
     async def startup(self) -> None:
@@ -484,7 +487,83 @@ class ProcessDisplayService(BaseService):
     def info(self) -> Dict[str, Any]:
         return {"name": "ProcessDisplayService", "ready": self._ready}
 
-    def fetch_minute_downsampled_df(self, pack_codes: List[str]):
+    def _latest_contiguous_segment(self,
+                                   df_pack: pd.DataFrame,
+                                   time_col: str,
+                                   gap_seconds: int = 3600
+                                   ) -> pd.DataFrame:
+        if df_pack is None or df_pack.empty:
+            return df_pack
+        times = pd.to_datetime(df_pack[time_col])
+        diffs = times.diff().dt.total_seconds().fillna(0)
+        split_idx = np.where(diffs > gap_seconds)[0].tolist()
+        if not split_idx:
+            return df_pack
+        last_split = split_idx[-1]
+        return df_pack.iloc[last_split:].reset_index(drop=True)
+
+    def normalize_label(self, s: str) -> str:
+        COMMON_NOISE_PATTERNS = [
+            r"\b测试\b",  # 测试
+            r"\bDCR\b",  # DCR
+            r"\b\d+P\d+S\b",  # 1P102S, etc.
+            r"\b\d+P\b",  # 1P
+            r"\bP\d+S\b",  # P102S
+            r"\b1P102S\b",  # explicit
+            r"[()（）\-_/]",  # 括号和连接符
+            r"\s+",  # 多余空白
+        ]
+
+        _noise_re = re.compile("|".join(COMMON_NOISE_PATTERNS), flags=re.IGNORECASE)
+
+        if s is None:
+            return ""
+        s = str(s)
+        s = _noise_re.sub(" ", s)
+        s = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", " ", s)
+        s = s.strip().lower()
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    def find_best_test_config_key(self,
+                                  label: str,
+                                  config: Dict[str, Dict],
+                                  fuzzy_threshold: float = 0.8
+                                  ) -> Optional[Tuple[str, Dict]]:
+        if not label:
+            return None
+
+        label_norm = self.normalize_label(label)
+        norm_map = {}
+        for k in config.keys():
+            kn = self.normalize_label(k)
+            norm_map[k] = kn
+
+        for orig_k, kn in norm_map.items():
+            if kn and kn in label_norm:
+                return orig_k, config[orig_k]
+
+        for orig_k, kn in norm_map.items():
+            if label_norm and label_norm in kn:
+                return orig_k, config[orig_k]
+
+        best_k = None
+        best_score = 0.0
+        for orig_k, kn in norm_map.items():
+            if not kn:
+                continue
+            score = difflib.SequenceMatcher(None, label_norm, kn).ratio()
+            if score > best_score:
+                best_score = score
+                best_k = orig_k
+
+        if best_k and best_score >= fuzzy_threshold:
+            return best_k, config[best_k]
+
+        return None
+
+    def fetch_minute_downsampled_df(self,
+                                    pack_codes: List[str]):
         num_cols = [
             "charge_energy", "discharge_energy",
             "charge_capacity", "discharge_capacity"
@@ -519,6 +598,7 @@ class ProcessDisplayService(BaseService):
                    t.discharge_energy,
                    t.charge_capacity,
                    t.discharge_capacity,
+                   t.vehicle_to_pack_num,
             """
 
         for c in bat_temp_cols + cell_volt_cols:
@@ -541,11 +621,7 @@ class ProcessDisplayService(BaseService):
             raise HTTPException(status_code=500, detail=f"数据库查询失败: {e}")
 
         if df is None or df.empty:
-            cols = ["vehicle_code", "acquire_time", "step_id", "step_name",
-                    "charge_energy", "discharge_energy", "charge_capacity", "discharge_capacity"]
-            for i, _ in enumerate(pack_codes, start=1):
-                cols += [f"{c}_p{i}" for c in (bat_temp_cols + cell_volt_cols)]
-            return pd.DataFrame(columns=cols)
+            raise HTTPException(status_code=500, detail="数据库查询失败")
 
         if "minute_ts" not in df.columns:
             raise HTTPException(status_code=500, detail="expected minute_ts in query result")
@@ -562,222 +638,639 @@ class ProcessDisplayService(BaseService):
             if pk_df.empty:
                 pack_dfs[pk] = None
                 continue
-            pk_df = pk_df.set_index("acquire_time").sort_index()
+            pk_df = pk_df.sort_values("acquire_time").reset_index(drop=True)
+            pk_df = self._latest_contiguous_segment(pk_df, time_col="acquire_time", gap_seconds=3600)
             pack_dfs[pk] = pk_df
 
-        primary_pk = next((pk for pk in pack_codes if pack_dfs.get(pk) is not None), None)
-        if primary_pk is None:
-            raise HTTPException(status_code=404, detail="未查询到任何 pack 的过程数据")
+        return pack_dfs
 
-        primary_df = pack_dfs[primary_pk][["vehicle_code", "step_id", "step_name"] + num_cols].copy()
-        primary_df["vehicle_code"] = primary_df["vehicle_code"].astype(str)
+        # primary_pk = next((pk for pk in pack_codes if pack_dfs.get(pk) is not None), None)
+        # if primary_pk is None:
+        #     raise HTTPException(status_code=404, detail="未找到任何 pack 的有效数据")
+        #
+        # all_times = pd.Index(
+        #     sorted({t for pkd in pack_dfs.values() if pkd is not None for t in pkd['acquire_time'].tolist()}))
+        #
+        # primary_indexed = pack_dfs[primary_pk].set_index("acquire_time").reindex(all_times)
+        # leading_meta = primary_indexed[["step_id", "step_name"]].copy()
+        # leading_meta = leading_meta.reset_index().rename(columns={"index": "acquire_time"})
+        # leading_meta = leading_meta[["step_id", "step_name", "acquire_time"]]
+        #
+        # def build_blocks_per_pack(cols_base):
+        #     blocks = []
+        #     for idx, pk in enumerate(pack_codes, start=1):
+        #         pk_df = pack_dfs.get(pk)
+        #         suffix = f"_p{idx}"
+        #         cols_for_pack = [f"{c}{suffix}" for c in cols_base]
+        #
+        #         if pk_df is None:
+        #             blocks.append(pd.DataFrame(index=all_times, columns=cols_for_pack, dtype=float))
+        #             continue
+        #
+        #         pk_reindexed = pk_df.set_index("acquire_time").reindex(all_times)
+        #
+        #         existing = [c for c in cols_base if c in pk_reindexed.columns]
+        #         missing = [c for c in cols_base if c not in pk_reindexed.columns]
+        #
+        #         if existing:
+        #             df_exist = pk_reindexed[existing].astype(float, errors="ignore").copy()
+        #             df_exist.columns = [f"{c}{suffix}" for c in df_exist.columns]
+        #         else:
+        #             df_exist = pd.DataFrame(index=all_times)
+        #
+        #         if missing:
+        #             df_missing = pd.DataFrame(index=all_times, columns=[f"{c}{suffix}" for c in missing], dtype=float)
+        #         else:
+        #             df_missing = None
+        #
+        #         if df_missing is None:
+        #             block = df_exist
+        #         elif df_exist.empty:
+        #             block = df_missing
+        #         else:
+        #             block = pd.concat([df_exist, df_missing], axis=1)
+        #
+        #         block = block.reindex(columns=cols_for_pack)
+        #         blocks.append(block)
+        #     return blocks
+        #
+        # num_blocks = build_blocks_per_pack(num_cols)
+        # temp_blocks = build_blocks_per_pack(bat_temp_cols)
+        # volt_blocks = build_blocks_per_pack(cell_volt_cols)
+        #
+        # if num_blocks:
+        #     num_concat = pd.concat(num_blocks, axis=1)
+        # else:
+        #     num_concat = pd.DataFrame(index=all_times)
+        #
+        # if temp_blocks:
+        #     temps_concat = pd.concat(temp_blocks, axis=1)
+        # else:
+        #     temps_concat = pd.DataFrame(index=all_times)
+        #
+        # if volt_blocks:
+        #     volts_concat = pd.concat(volt_blocks, axis=1)
+        # else:
+        #     volts_concat = pd.DataFrame(index=all_times)
+        #
+        # leading_meta_indexed = leading_meta.set_index("acquire_time")
+        # meta_full = pd.concat([leading_meta_indexed, num_concat], axis=1)
+        # meta_df = meta_full.reset_index().rename(columns={"index": "acquire_time"})
+        # meta_expected_cols = ["step_id", "step_name", "acquire_time"] + [f"{c}_p{j}" for j in
+        #                                                                  range(1, len(pack_codes) + 1) for c in
+        #                                                                  num_cols]
+        #
+        # for c in meta_expected_cols:
+        #     if c not in meta_df.columns:
+        #         meta_df[c] = np.nan
+        #
+        # meta_df = meta_df[meta_expected_cols].copy()
+        #
+        # temps_full = pd.concat([leading_meta_indexed, temps_concat], axis=1)
+        # temps_df = temps_full.reset_index().rename(columns={"index": "acquire_time"})
+        # volts_full = pd.concat([leading_meta_indexed, volts_concat], axis=1)
+        # volts_df = volts_full.reset_index().rename(columns={"index": "acquire_time"})
+        #
+        # temps_expected = ["step_id", "step_name", "acquire_time"] + [f"{c}_p{j}" for j in range(1, len(pack_codes) + 1)
+        #                                                              for c in bat_temp_cols]
+        # volts_expected = ["step_id", "step_name", "acquire_time"] + [f"{c}_p{j}" for j in range(1, len(pack_codes) + 1)
+        #                                                              for c in cell_volt_cols]
+        #
+        # for c in temps_expected:
+        #     if c not in temps_df.columns:
+        #         temps_df[c] = np.nan
+        # for c in volts_expected:
+        #     if c not in volts_df.columns:
+        #         volts_df[c] = np.nan
+        #
+        # temps_df = temps_df[temps_expected].copy()
+        # volts_df = volts_df[volts_expected].copy()
+        #
+        # meta_df = meta_df.copy()
+        # temps_df = temps_df.copy()
+        # volts_df = volts_df.copy()
+        #
+        # return meta_df, temps_df, volts_df
+        # primary_pk = next((pk for pk in pack_codes if pack_dfs.get(pk) is not None), None)
+        # if primary_pk is None:
+        #     raise HTTPException(status_code=404, detail="未查询到任何 pack 的过程数据")
+        #
+        # primary_df = pack_dfs[primary_pk][["vehicle_code", "step_id", "step_name"] + num_cols].copy()
+        # primary_df["vehicle_code"] = primary_df["vehicle_code"].astype(str)
+        #
+        # all_times = pd.Index(sorted({t for pkd in pack_dfs.values() if pkd is not None for t in pkd.index}))
+        #
+        # primary_df_reindexed = primary_df.reindex(all_times)
+        #
+        # base_block = primary_df_reindexed[
+        #     ["vehicle_code", "step_id", "step_name", "charge_energy", "discharge_energy", "charge_capacity",
+        #      "discharge_capacity"]].copy()
+        #
+        # dfs_to_concat = [base_block]
+        #
+        # for idx, pk in enumerate(pack_codes, start=1):
+        #     pk_df = pack_dfs.get(pk)
+        #     suffix = f"_p{idx}"
+        #     cols = bat_temp_cols + cell_volt_cols
+        #
+        #     if pk_df is None:
+        #         nan_block = pd.DataFrame(index=all_times, columns=[f"{c}{suffix}" for c in cols], dtype=float)
+        #         dfs_to_concat.append(nan_block)
+        #         continue
+        #
+        #     pk_vals = pk_df.reindex(all_times)
+        #     existing = [c for c in cols if c in pk_vals.columns]
+        #     missing = [c for c in cols if c not in pk_vals.columns]
+        #
+        #     if existing:
+        #         df_existing = pk_vals[existing].astype(float, errors="ignore").copy()
+        #         df_existing.columns = [f"{c}{suffix}" for c in df_existing.columns]
+        #     else:
+        #         df_existing = pd.DataFrame(index=all_times)
+        #
+        #     if missing:
+        #         df_missing = pd.DataFrame(index=all_times, columns=[f"{c}{suffix}" for c in missing], dtype=float)
+        #     else:
+        #         df_missing = None
+        #
+        #     if df_missing is None:
+        #         pack_block = df_existing
+        #     elif df_existing.empty:
+        #         pack_block = df_missing
+        #     else:
+        #         pack_block = pd.concat([df_existing, df_missing], axis=1)
+        #
+        #     desired_order = [f"{c}{suffix}" for c in cols]
+        #     pack_block = pack_block.reindex(columns=desired_order)
+        #
+        #     dfs_to_concat.append(pack_block)
+        #
+        # final_df = pd.concat(dfs_to_concat, axis=1)
+        # final_df = final_df.reset_index().rename(columns={"index": "acquire_time"})
+        #
+        # ordered_cols = ["vehicle_code", "acquire_time", "step_id", "step_name",
+        #                 "charge_energy", "discharge_energy", "charge_capacity", "discharge_capacity"]
+        # for idx in range(1, len(pack_codes) + 1):
+        #     ordered_cols += [f"{c}_p{idx}" for c in (bat_temp_cols + cell_volt_cols)]
+        #
+        # for c in ordered_cols:
+        #     if c not in final_df.columns:
+        #         final_df[c] = np.nan
+        #
+        # final_df = final_df[ordered_cols]
+        #
+        # final_df = final_df.copy()
+        #
+        # return final_df
 
-        all_times = pd.Index(sorted({t for pkd in pack_dfs.values() if pkd is not None for t in pkd.index}))
+    def process_pack_dfs(self, pack_dfs: Dict[str, pd.DataFrame]):
+        volt_sum_by_time = defaultdict(float)
+        temp_min_by_time = {}
+        step_name_by_time = {}
+        volt_max_by_time: Dict[str, float] = {}
+        volt_min_by_time: Dict[str, float] = {}
+        charge_energy_by_time = {}
+        discharge_energy_by_time = {}
+        charge_capacity_by_time = {}
+        discharge_capacity_by_time = {}
 
-        primary_df_reindexed = primary_df.reindex(all_times)
+        bat_temp_cols = [f"bms_batttemp{i}" for i in range(1, 9)]
+        cell_volt_cols = [f"bms_cellvolt{i}" for i in range(1, 103)]
 
-        base_block = primary_df_reindexed[
-            ["vehicle_code", "step_id", "step_name", "charge_energy", "discharge_energy", "charge_capacity",
-             "discharge_capacity"]].copy()
-
-        dfs_to_concat = [base_block]
-
-        for idx, pk in enumerate(pack_codes, start=1):
-            pk_df = pack_dfs.get(pk)
-            suffix = f"_p{idx}"
-            cols = bat_temp_cols + cell_volt_cols
-
-            if pk_df is None:
-                nan_block = pd.DataFrame(index=all_times, columns=[f"{c}{suffix}" for c in cols], dtype=float)
-                dfs_to_concat.append(nan_block)
+        for pk, pk_df in pack_dfs.items():
+            if pk_df is None or pk_df.empty:
                 continue
+            try:
+                pk_df = pk_df.copy()
+                pk_df["acquire_time"] = pd.to_datetime(pk_df["acquire_time"])
+            except Exception:
+                pass
 
-            pk_vals = pk_df.reindex(all_times)
-            existing = [c for c in cols if c in pk_vals.columns]
-            missing = [c for c in cols if c not in pk_vals.columns]
-
-            if existing:
-                df_existing = pk_vals[existing].astype(float, errors="ignore").copy()
-                df_existing.columns = [f"{c}{suffix}" for c in df_existing.columns]
-            else:
-                df_existing = pd.DataFrame(index=all_times)
-
-            if missing:
-                df_missing = pd.DataFrame(index=all_times, columns=[f"{c}{suffix}" for c in missing], dtype=float)
-            else:
-                df_missing = None
-
-            if df_missing is None:
-                pack_block = df_existing
-            elif df_existing.empty:
-                pack_block = df_missing
-            else:
-                pack_block = pd.concat([df_existing, df_missing], axis=1)
-
-            desired_order = [f"{c}{suffix}" for c in cols]
-            pack_block = pack_block.reindex(columns=desired_order)
-
-            dfs_to_concat.append(pack_block)
-
-        final_df = pd.concat(dfs_to_concat, axis=1)
-        final_df = final_df.reset_index().rename(columns={"index": "acquire_time"})
-
-        ordered_cols = ["vehicle_code", "acquire_time", "step_id", "step_name",
-                        "charge_energy", "discharge_energy", "charge_capacity", "discharge_capacity"]
-        for idx in range(1, len(pack_codes) + 1):
-            ordered_cols += [f"{c}_p{idx}" for c in (bat_temp_cols + cell_volt_cols)]
-
-        for c in ordered_cols:
-            if c not in final_df.columns:
-                final_df[c] = np.nan
-
-        final_df = final_df[ordered_cols]
-
-        final_df = final_df.copy()
-
-        return final_df
-
-    def _fmt_ts(self, t) -> Optional[str]:
-        if pd.isna(t):
-            return None
-        try:
-            return pd.Timestamp(t).isoformat()
-        except Exception:
-            return str(t)
-
-    def extract_step_ranges(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
-        if df is None or df.empty:
-            return []
-
-        if "acquire_time" not in df.columns:
-            raise ValueError("DataFrame must contain 'acquire_time' column")
-
-        try:
-            times = pd.to_datetime(df["acquire_time"])
-            df = df.copy()
-            df["acquire_time"] = times
-        except Exception:
-            df = df.copy()
-
-        mask_valid = ~(
-                df.get("step_id").isna() & df.get("step_name").isna()
-        )
-        df_valid = df[mask_valid]
-        if df_valid.empty:
-            return []
-
-        grouped = df_valid.groupby(["step_id", "step_name"], sort=False)
-
-        out = []
-        for (sid, sname), g in grouped:
-            start_ts = g["acquire_time"].min()
-            end_ts = g["acquire_time"].max()
-
-            sid_norm = sid
-            if pd.notna(sid):
+            for _, row in pk_df.iterrows():
                 try:
-                    if isinstance(sid, float) and sid.is_integer():
-                        sid_norm = int(sid)
+                    t_key = pd.Timestamp(row["acquire_time"]).isoformat()
                 except Exception:
-                    pass
+                    t_key = str(row["acquire_time"])
 
-            sname_norm = None if pd.isna(sname) else str(sname)
+                vals = pd.to_numeric(row[cell_volt_cols], errors="coerce").astype(float)
+                vals_nonan = vals[~np.isnan(vals)]
+                if not vals_nonan.empty:
+                    sum_val = float(vals_nonan.sum())
+                    volt_sum_by_time[t_key] += sum_val
 
-            out.append({
-                "step_id": None if pd.isna(sid_norm) else sid_norm,
-                "step_name": sname_norm,
-                "range": [self._fmt_ts(start_ts), self._fmt_ts(end_ts)]
-            })
+                    row_max = float(vals_nonan.max())
+                    row_min = float(vals_nonan.min())
+                    if t_key in volt_max_by_time:
+                        volt_max_by_time[t_key] = max(volt_max_by_time[t_key], row_max)
+                    else:
+                        volt_max_by_time[t_key] = row_max
+                    if t_key in volt_min_by_time:
+                        volt_min_by_time[t_key] = min(volt_min_by_time[t_key], row_min)
+                    else:
+                        volt_min_by_time[t_key] = row_min
 
-        out_sorted = sorted(out, key=lambda x: (x["range"][0] is None, x["range"][0]))
-        return out_sorted
+                    res = self.find_best_test_config_key(row["vehicle_to_pack_num"], self.test_process_map)
+                    test_process_info = res[1] if res else None
 
-    def process_display(self, pack_codes):
-        df = self.fetch_minute_downsampled_df(pack_codes)
+                    if test_process_info:
+                        step_name_by_time[t_key] = test_process_info.get(row["step_id"])
+                    else:
+                        step_name_by_time[t_key] = row["step_name"]
 
-        if df is None or df.empty:
-            return {
-                "voltage_series": [],
-                "temperature_series": [],
-                "charge_energy_list": [],
-                "discharge_energy_list": [],
-                "charge_capacity_list": [],
-                "discharge_capacity_list": [],
-                "volt_diff_list": [],
-                "time_list": [],
-            }
+                tvals = pd.to_numeric(row[bat_temp_cols], errors="coerce").astype(float)
+                tvals_nonan = tvals[~np.isnan(tvals)]
+                if not tvals_nonan.empty:
+                    cur_min = float(tvals_nonan.min())
+                    if t_key in temp_min_by_time:
+                        temp_min_by_time[t_key] = min(temp_min_by_time[t_key], cur_min)
+                    else:
+                        temp_min_by_time[t_key] = cur_min
 
-        cell_cols = [c for c in df.columns if c.lower().startswith("bms_cellvolt")]
-        temp_cols = [c for c in df.columns if c.lower().startswith("bms_batttemp")]
+                if "charge_energy" in row.index and (t_key not in charge_energy_by_time):
+                    v = row.get("charge_energy")
+                    if pd.notna(v):
+                        charge_energy_by_time[t_key] = float(v)
+                if "discharge_energy" in row.index and (t_key not in discharge_energy_by_time):
+                    v = row.get("discharge_energy")
+                    if pd.notna(v):
+                        discharge_energy_by_time[t_key] = float(v)
+                if "charge_capacity" in row.index and (t_key not in charge_capacity_by_time):
+                    v = row.get("charge_capacity")
+                    if pd.notna(v):
+                        charge_capacity_by_time[t_key] = float(v)
+                if "discharge_capacity" in row.index and (t_key not in discharge_capacity_by_time):
+                    v = row.get("discharge_capacity")
+                    if pd.notna(v):
+                        discharge_capacity_by_time[t_key] = float(v)
 
-        if cell_cols:
-            df[cell_cols] = df[cell_cols].apply(pd.to_numeric, errors="coerce")
-        if temp_cols:
-            df[temp_cols] = df[temp_cols].apply(pd.to_numeric, errors="coerce")
+        all_times_keys = sorted(
+            set(list(volt_sum_by_time.keys()) +
+                list(temp_min_by_time.keys()) +
+                list(charge_energy_by_time.keys()) +
+                list(discharge_energy_by_time.keys()) +
+                list(charge_capacity_by_time.keys()) +
+                list(discharge_capacity_by_time.keys()) +
+                list(volt_max_by_time.keys()) +
+                list(volt_min_by_time.keys()))
+        )
 
-        if cell_cols:
-            volt_sum = df[cell_cols].sum(axis=1, skipna=True)
-            all_nan_mask = df[cell_cols].isna().all(axis=1)
-            volt_sum = volt_sum.where(~all_nan_mask, np.nan)
-        else:
-            volt_sum = pd.Series([np.nan] * len(df), index=df.index)
+        volt_sum_by_time = dict(sorted(volt_sum_by_time.items(), key=lambda x: x[0]))
+        temp_min_by_time = dict(sorted(temp_min_by_time.items(), key=lambda x: x[0]))
 
-        if temp_cols:
-            temp_min = df[temp_cols].min(axis=1, skipna=True)
-            alltemp_nan_mask = df[temp_cols].isna().all(axis=1)
-            temp_min = temp_min.where(~alltemp_nan_mask, np.nan)
-        else:
-            temp_min = pd.Series([np.nan] * len(df), index=df.index)
+        charge_energy_by_time = dict(sorted(charge_energy_by_time.items(), key=lambda x: x[0]))
+        discharge_energy_by_time = dict(sorted(discharge_energy_by_time.items(), key=lambda x: x[0]))
+        charge_capacity_by_time = dict(sorted(charge_capacity_by_time.items(), key=lambda x: x[0]))
+        discharge_capacity_by_time = dict(sorted(discharge_capacity_by_time.items(), key=lambda x: x[0]))
 
-        if cell_cols:
-            volt_max = df[cell_cols].max(axis=1, skipna=True)
-            volt_min = df[cell_cols].min(axis=1, skipna=True)
-            volt_diff = round(volt_max - volt_min, 3)
-            volt_diff = volt_diff.where(~all_nan_mask, np.nan)
-        else:
-            volt_diff = pd.Series([np.nan] * len(df), index=df.index)
+        step_name_by_time = dict(sorted(step_name_by_time.items(), key=lambda x: x[0]))
 
-        def _col_to_list(col_name):
-            if col_name in df.columns:
-                s = pd.to_numeric(df[col_name], errors="coerce")
-                return [None if (x is np.nan or pd.isna(x)) else float(x) for x in s.tolist()]
+        volt_diff_by_time = {}
+        for t in all_times_keys:
+            vmax = volt_max_by_time.get(t)
+            vmin = volt_min_by_time.get(t)
+            if vmax is None or vmin is None:
+                volt_diff_by_time[t] = None
             else:
-                return [None] * len(df)
+                volt_diff_by_time[t] = float(round(vmax - vmin, 3))
 
-        charge_energy_list = _col_to_list("charge_energy")
-        discharge_energy_list = _col_to_list("discharge_energy")
-        charge_capacity_list = _col_to_list("charge_capacity")
-        discharge_capacity_list = _col_to_list("discharge_capacity")
-
-        time_series = df.get("acquire_time")
-        time_list: List[Optional[str]]
-        if time_series is None:
-            time_list = [None] * len(df)
-        else:
-            if pd.api.types.is_datetime64_any_dtype(time_series):
-                time_list = [None if pd.isna(t) else pd.Timestamp(t).isoformat() for t in time_series.tolist()]
-            else:
-                time_list = [None if pd.isna(t) else str(t) for t in time_series.tolist()]
-
-        def series_to_list(s: pd.Series) -> List[Optional[float]]:
-            return [None if (x is np.nan or pd.isna(x)) else float(x) for x in s.tolist()]
-
-        voltage_series = series_to_list(volt_sum)
-        temperature_series = series_to_list(temp_min)
-        volt_diff_list = series_to_list(volt_diff)
-
-        result = {
-            "voltage_series": voltage_series,
-            "temperature_series": temperature_series,
-            "charge_energy_list": charge_energy_list,
-            "discharge_energy_list": discharge_energy_list,
-            "charge_capacity_list": charge_capacity_list,
-            "discharge_capacity_list": discharge_capacity_list,
-            "volt_diff_list": volt_diff_list,
-            "time_list": time_list,
+        return {
+            "volt_sum_by_time": volt_sum_by_time,
+            "temp_min_by_time": temp_min_by_time,
+            "volt_diff_by_time": volt_diff_by_time,
+            "charge_energy_by_time": charge_energy_by_time,
+            "discharge_energy_by_time": discharge_energy_by_time,
+            "charge_capacity_by_time": charge_capacity_by_time,
+            "discharge_capacity_by_time": discharge_capacity_by_time,
+            "step_name_by_time": step_name_by_time
         }
 
-        result.update({'all_segments': self.extract_step_ranges(df)})
+    # def _cols_group_by_base(self, cols: List[str]) -> Dict[str, List[str]]:
+    #     _COL_SUFFIX_RE = re.compile(r"^(?P<base>.+)_p(?P<idx>\d+)$", flags=re.IGNORECASE)
+    #     groups: Dict[str, List[Tuple[int, str]]] = {}
+    #     for c in cols:
+    #         m = _COL_SUFFIX_RE.match(c)
+    #         if not m:
+    #             continue
+    #         base = m.group("base")
+    #         idx = int(m.group("idx"))
+    #         groups.setdefault(base, []).append((idx, c))
+    #     return {base: [col for idx, col in sorted(lst, key=lambda x: x[0])] for base, lst in groups.items()}
+    #
+    # def _series_to_pylist_for_json(self, s: pd.Series) -> List[Optional[float]]:
+    #     """Convert series to JSON-friendly list: NaN -> None, numpy scalars -> python float/int"""
+    #     out = []
+    #     for v in s.tolist():
+    #         if pd.isna(v):
+    #             out.append(None)
+    #         elif isinstance(v, (np.floating, float)):
+    #             out.append(float(v))
+    #         elif isinstance(v, (np.integer, int)):
+    #             out.append(int(v))
+    #         else:
+    #             # try numeric cast
+    #             try:
+    #                 fv = float(v)
+    #                 out.append(fv)
+    #             except Exception:
+    #                 out.append(v)
+    #     return out
+    #
+    # def meta_bases_to_2d_arrays(self, meta_df: pd.DataFrame, num_cols_base: List[str]) -> Dict[str, Dict[str, Any]]:
+    #     """
+    #     For each base in num_cols_base, produce a JSON-serializable 2D-array object.
+    #     Output format per base:
+    #       {
+    #         "shape": [n_columns, length],
+    #         "cols": [colname1, colname2, ...],  # kept column names (suffix form)
+    #         "data": [[row0_col0, row1_col0, ...],  # column-major OR row-major? we choose row-major per column arrays -> each inner list is one column (len==length)
+    #                  [...], ...]
+    #       }
+    #
+    #     Implementation detail:
+    #       - We detect columns like 'charge_energy_p1','charge_energy_p2',... and keep only those.
+    #       - If only one column exists (or only one distinct column after comparing equality), still return shape [1, length].
+    #       - NaN are converted to None for JSON.
+    #     """
+    #     if meta_df is None or meta_df.empty:
+    #         return {b: {"shape": [0, 0], "cols": [], "data": []} for b in num_cols_base}
+    #
+    #     # ensure index alignment by acquire_time if present
+    #     df = meta_df.copy()
+    #     if "acquire_time" in df.columns:
+    #         try:
+    #             df["acquire_time"] = pd.to_datetime(df["acquire_time"])
+    #         except Exception:
+    #             pass
+    #
+    #     # find grouped suffix columns
+    #     all_cols = df.columns.tolist()
+    #     grouped = self._cols_group_by_base(all_cols)
+    #
+    #     result: Dict[str, Dict[str, Any]] = {}
+    #     length = len(df)
+    #
+    #     for base in num_cols_base:
+    #         # find matching group key ignoring case
+    #         match_key = None
+    #         for k in grouped.keys():
+    #             if k.lower() == base.lower():
+    #                 match_key = k
+    #                 break
+    #
+    #         if match_key is None:
+    #             # fallback: maybe there is a bare column (no _p suffix)
+    #             if base in df.columns:
+    #                 colnames = [base]
+    #             else:
+    #                 # no data for this base
+    #                 result[base] = {"shape": [0, 0], "cols": [], "data": []}
+    #                 continue
+    #         else:
+    #             colnames = grouped[match_key]
+    #
+    #         # Extract columns arrays and convert to JSON-friendly lists per column
+    #         col_lists: List[List[Optional[float]]] = []
+    #         kept_cols: List[str] = []
+    #         for cname in colnames:
+    #             if cname not in df.columns:
+    #                 # column name missing, produce all-None column
+    #                 col_lists.append([None] * length)
+    #                 kept_cols.append(cname)
+    #                 continue
+    #             series = pd.to_numeric(df[cname], errors="coerce")
+    #             col_py = self._series_to_pylist_for_json(series)
+    #             col_lists.append(col_py)
+    #             kept_cols.append(cname)
+    #
+    #         # Optional: detect if multiple columns are identical; if all identical, keep only one column
+    #         # Compare each column to the first using strict element-wise equality allowing NaN==NaN
+    #         if len(col_lists) > 1:
+    #             first = col_lists[0]
+    #             all_same = True
+    #             for other in col_lists[1:]:
+    #                 # elementwise compare (None considered equal to None)
+    #                 if len(other) != len(first):
+    #                     all_same = False
+    #                     break
+    #                 for a, b in zip(first, other):
+    #                     if a is None and b is None:
+    #                         continue
+    #                     # both numbers?
+    #                     if (a is None) != (b is None):
+    #                         all_same = False
+    #                         break
+    #                     # numeric compare with tolerance
+    #                     try:
+    #                         if abs(float(a) - float(b)) > 1e-9:
+    #                             all_same = False
+    #                             break
+    #                     except Exception:
+    #                         if a != b:
+    #                             all_same = False
+    #                             break
+    #                 if not all_same:
+    #                     break
+    #             if all_same:
+    #                 # keep only the first column
+    #                 col_lists = [first]
+    #                 kept_cols = [kept_cols[0]]
+    #
+    #         # Build result: we choose data as list-of-rows-per-column? Here we keep column-major: each inner list is one column (length entries)
+    #         ncols = len(col_lists)
+    #         result[base] = {
+    #             "shape": [ncols, length],
+    #             "cols": kept_cols,
+    #             "data": col_lists
+    #         }
+    #
+    #     return result
+    #
+    # def _fmt_ts(self, t) -> Optional[str]:
+    #     if pd.isna(t):
+    #         return None
+    #     try:
+    #         return pd.Timestamp(t).isoformat()
+    #     except Exception:
+    #         return str(t)
+    #
+    # def extract_step_ranges(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+    #     """
+    #     按 (step_id, step_name) 全局分组，返回每组的最早和最晚 acquire_time。
+    #     仅返回那些 step_id 是整数或能被解释为整数的项（如 '1','2','03' 或 1, 2.0）。
+    #     """
+    #     if df is None or df.empty:
+    #         return []
+    #
+    #     if "acquire_time" not in df.columns:
+    #         raise ValueError("DataFrame must contain 'acquire_time' column")
+    #
+    #     # ensure datetime for reliable min/max
+    #     try:
+    #         times = pd.to_datetime(df["acquire_time"])
+    #         df = df.copy()
+    #         df["acquire_time"] = times
+    #     except Exception:
+    #         df = df.copy()
+    #
+    #     # drop rows where both step_id and step_name are null
+    #     mask_valid = ~(
+    #             df.get("step_id").isna() & df.get("step_name").isna()
+    #     )
+    #     df_valid = df[mask_valid]
+    #     if df_valid.empty:
+    #         return []
+    #
+    #     grouped = df_valid.groupby(["step_id", "step_name"], sort=False)
+    #
+    #     def _is_integer_like(x) -> bool:
+    #         """判断 step_id 是否为整数或可解释为整数的字符串（例如 '1','02'）。"""
+    #         if x is None or (isinstance(x, float) and np.isnan(x)):
+    #             return False
+    #         # ints
+    #         if isinstance(x, (int, np.integer)):
+    #             return True
+    #         # floats that are integer-valued
+    #         if isinstance(x, float):
+    #             return float(x).is_integer()
+    #         # strings of digits (allow leading zeros)
+    #         if isinstance(x, str):
+    #             s = x.strip()
+    #             return s.isdigit()
+    #         return False
+    #
+    #     out = []
+    #     for (sid, sname), g in grouped:
+    #         # only keep numeric-like step_id
+    #         if not _is_integer_like(sid):
+    #             continue
+    #
+    #         start_ts = g["acquire_time"].min()
+    #         end_ts = g["acquire_time"].max()
+    #
+    #         # normalize sid to int if possible
+    #         sid_norm = sid
+    #         if isinstance(sid, str):
+    #             try:
+    #                 sid_norm = int(sid.strip())
+    #             except Exception:
+    #                 # fallback: if it was float-like string, try float->int
+    #                 try:
+    #                     sf = float(sid)
+    #                     if sf.is_integer():
+    #                         sid_norm = int(sf)
+    #                 except Exception:
+    #                     pass
+    #         elif isinstance(sid, float):
+    #             if sid.is_integer():
+    #                 sid_norm = int(sid)
+    #
+    #         sname_norm = None if pd.isna(sname) else str(sname)
+    #
+    #         out.append({
+    #             "step_id": None if pd.isna(sid_norm) else sid_norm,
+    #             "step_name": sname_norm,
+    #             "range": [self._fmt_ts(start_ts), self._fmt_ts(end_ts)]
+    #         })
+    #
+    #     # sort by start time (None go last)
+    #     out_sorted = sorted(out, key=lambda x: (x["range"][0] is None, x["range"][0]))
+    #     return out_sorted
+
+    def process_display(self, pack_codes):
+        pack_dfs = self.fetch_minute_downsampled_df(pack_codes)
+        result = self.process_pack_dfs(pack_dfs)
+
+        # if meta_df is None or meta_df.empty:
+        #     return {
+        #         "voltage_series": [],
+        #         "temperature_series": [],
+        #         "charge_energy_list": [],
+        #         "discharge_energy_list": [],
+        #         "charge_capacity_list": [],
+        #         "discharge_capacity_list": [],
+        #         "volt_diff_list": [],
+        #         "time_list": [],
+        #     }
+        #
+        # cell_cols = [c for c in volts_df.columns if c.lower().startswith("bms_cellvolt")]
+        # temp_cols = [c for c in temps_df.columns if c.lower().startswith("bms_batttemp")]
+        #
+        # if cell_cols:
+        #     volts_df[cell_cols] = volts_df[cell_cols].apply(pd.to_numeric, errors="coerce")
+        # if temp_cols:
+        #     temps_df[temp_cols] = temps_df[temp_cols].apply(pd.to_numeric, errors="coerce")
+        #
+        # if cell_cols:
+        #     volt_sum = volts_df[cell_cols].sum(axis=1, skipna=True)
+        #     all_nan_mask = volts_df[cell_cols].isna().all(axis=1)
+        #     volt_sum = volt_sum.where(~all_nan_mask, np.nan)
+        # else:
+        #     volt_sum = pd.Series([np.nan] * len(volts_df), index=volts_df.index)
+        #
+        # if temp_cols:
+        #     temp_min = temps_df[temp_cols].min(axis=1, skipna=True)
+        #     alltemp_nan_mask = temps_df[temp_cols].isna().all(axis=1)
+        #     temp_min = temp_min.where(~alltemp_nan_mask, np.nan)
+        # else:
+        #     temp_min = pd.Series([np.nan] * len(temps_df), index=temps_df.index)
+        #
+        # if cell_cols:
+        #     volt_max = volts_df[cell_cols].max(axis=1, skipna=True)
+        #     volt_min = volts_df[cell_cols].min(axis=1, skipna=True)
+        #     volt_diff = round(volt_max - volt_min, 3)
+        #     volt_diff = volt_diff.where(~all_nan_mask, np.nan)
+        # else:
+        #     volt_diff = pd.Series([np.nan] * len(volts_df), index=volts_df.index)
+        #
+        # result = self.meta_bases_to_2d_arrays(meta_df, ["charge_energy", "discharge_energy", "charge_capacity", "discharge_capacity"])
+        # def _col_to_list(col_name):
+        #     if col_name in df.columns:
+        #         s = pd.to_numeric(df[col_name], errors="coerce")
+        #         return [None if (x is np.nan or pd.isna(x)) else float(x) for x in s.tolist()]
+        #     else:
+        #         return [None] * len(df)
+
+        # charge_energy_list = _col_to_list("charge_energy")
+        # discharge_energy_list = _col_to_list("discharge_energy")
+        # charge_capacity_list = _col_to_list("charge_capacity")
+        # discharge_capacity_list = _col_to_list("discharge_capacity")
+
+        # charge_energy_list = result.get("charge_energy").get('data')
+        # discharge_energy_list = result.get("discharge_energy").get('data')
+        # charge_capacity_list = result.get("charge_capacity").get('data')
+        # discharge_capacity_list = result.get("discharge_capacity").get('data')
+        #
+        #
+        #
+        # time_series = meta_df.get("acquire_time")
+        # time_list: List[Optional[str]]
+        # if time_series is None:
+        #     time_list = [None] * len(meta_df)
+        # else:
+        #     if pd.api.types.is_datetime64_any_dtype(time_series):
+        #         time_list = [None if pd.isna(t) else pd.Timestamp(t).isoformat() for t in time_series.tolist()]
+        #     else:
+        #         time_list = [None if pd.isna(t) else str(t) for t in time_series.tolist()]
+        #
+        # def series_to_list(s: pd.Series) -> List[Optional[float]]:
+        #     return [None if (x is np.nan or pd.isna(x)) else float(x) for x in s.tolist()]
+        #
+        # voltage_series = series_to_list(volt_sum)
+        # temperature_series = series_to_list(temp_min)
+        # volt_diff_list = series_to_list(volt_diff)
+        #
+        # result = {
+        #     "voltage_series": voltage_series,
+        #     "temperature_series": temperature_series,
+        #     "charge_energy_list": charge_energy_list,
+        #     "discharge_energy_list": discharge_energy_list,
+        #     "charge_capacity_list": charge_capacity_list,
+        #     "discharge_capacity_list": discharge_capacity_list,
+        #     "volt_diff_list": volt_diff_list,
+        #     "time_list": time_list,
+        # }
+        #
+        # result.update({'all_segments': self.extract_step_ranges(meta_df)})
 
         return result
 
