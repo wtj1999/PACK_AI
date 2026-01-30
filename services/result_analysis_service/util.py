@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import Dict, List, Optional, Iterable
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 
@@ -10,7 +10,6 @@ class DataValidator:
     @staticmethod
     def is_valid_pack_cell_df(
             df: pd.DataFrame,
-            expected: int = 102,
             logger: logging.Logger = None
     ) -> bool:
         log = logger or logging.getLogger(__name__)
@@ -19,32 +18,50 @@ class DataValidator:
             log.error("输入 DataFrame 中缺少列 'pack_code'，无法校验")
             return False
 
-        pack_code = df['pack_code'].dropna().unique().tolist()
+        pack_codes = df['pack_code'].dropna().unique().tolist()
 
-        if len(df) != expected:
+        for p in pack_codes:
+            sub = df[df['pack_code'] == p]
+            cnt = len(sub)
+            if cnt != 102 and cnt != 96:
                 log.error(
-                    "当前pack码 %s -> 电芯码数量 %d -> 期望 %d -> 数据有误，不做处理",
-                    pack_code, len(df), expected
+                    "当前pack码 %s -> 电芯码数量 %d -> 期望 102/96 -> 数据有误，不做处理",
+                     p, cnt
                 )
                 return False
 
         return True
 
     @staticmethod
-    def _normalize_required_steps(required_steps: Optional[Iterable[int]]) -> set:
-        if required_steps is None:
-            return set(range(1, 10))
-        return set(int(x) for x in required_steps)
+    def extract_series_count(s: str) -> Optional[int]:
+        _PAT_P_S = re.compile(r'[pP]\s*(\d+)\s*[sS]')
+        _PAT_S = re.compile(r'(\d+)\s*[sS]')
+
+        if not s:
+            return None
+        m = _PAT_P_S.search(s)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+        m2 = _PAT_S.findall(s)
+        if m2:
+            try:
+                return int(m2[-1])
+            except Exception:
+                return None
+        return None
 
     @staticmethod
     def is_valid_pack_result_df(
             df: pd.DataFrame,
-            required_steps: Optional[Iterable[int]] = None,
+            required_steps: Optional[List[str]] = None,
             logger: Optional[logging.Logger] = None
     ) -> bool:
 
         log = logger or logging.getLogger(__name__)
-        req_steps = DataValidator._normalize_required_steps(required_steps)
+        req_steps = set(required_steps)
 
         if 'pack_code' not in df.columns:
             log.error("输入 DataFrame 缺少列 'pack_code'，无法校验")
@@ -53,18 +70,42 @@ class DataValidator:
             log.error("输入 DataFrame 缺少列 'step_id'，无法校验")
             return False
 
-        pack_code = df['pack_code'].dropna().unique().tolist()
-        step_nums = pd.to_numeric(df['step_id'], errors='coerce').dropna().astype(int).unique()
-        step_set = set(step_nums)
-        missing_steps = sorted(list(req_steps - step_set))
-        if missing_steps:
-            log.error(
-                "当前pack码 %s -> 缺失必要电测工步 %s -> 数据有误不做处理",
-                pack_code, missing_steps
-            )
-            return False
+        pack_codes = df['pack_code'].dropna().unique().tolist()
+        for p in pack_codes:
+            sub_step_id = set(df[df['pack_code'] == p]['step_id'].values)
+            missing_steps = sorted(list(req_steps - sub_step_id))
+            if missing_steps:
+                log.error(
+                    "当前pack码 %s -> 缺失必要电测工步 %s -> 数据有误不做处理",
+                    p, missing_steps
+                )
+                return False
 
         return True
+
+    @staticmethod
+    def is_valid_cell_result_df(vehicle_result_df: pd.DataFrame,
+                                vehicle_cell_df: pd.DataFrame,
+                                logger: Optional[logging.Logger] = None) -> Tuple[List[str], bool]:
+
+        log = logger or logging.getLogger(__name__)
+
+        pack_codes_from_cell = vehicle_cell_df['pack_code'].dropna().unique().tolist()
+        pack_codes_from_result = vehicle_result_df['pack_code'].dropna().unique().tolist()
+        pack_codes_from_cell.sort()
+        pack_codes_from_result.sort()
+
+        if pack_codes_from_cell != pack_codes_from_result:
+            log.error(
+                "当前电测数据和电芯数据无法匹配 -> 不做处理; cell packs=%s result packs=%s",
+                pack_codes_from_cell, pack_codes_from_result
+            )
+            return pack_codes_from_cell, False
+        else:
+            return pack_codes_from_cell, True
+
+
+
 
 
 class PackFrameBuilder:
@@ -81,29 +122,44 @@ class PackFrameBuilder:
         self._idx_re = re.compile(r"(\d+)")
 
     def build_frames(self,
-                     cell_df: pd.DataFrame,
-                     result_df: pd.DataFrame) -> pd.DataFrame:
+                     vehicle_result_df: pd.DataFrame,
+                     vehicle_cell_df: pd.DataFrame,
+                     pack_codes: List[str],
+                     n_cells: int) -> pd.DataFrame:
 
-        if self.step_id_col not in result_df.columns:
+        if self.step_id_col not in vehicle_result_df.columns:
             raise KeyError(f"Result DataFrame missing required column '{self.step_id_col}'")
 
-        volt_cols = [c for c in result_df.columns if c and c.startswith(self.volt_prefix)]
+        volt_cols = [f'bms_cellvolt{i + 1}' for i in range(n_cells)]
+        pack_score_df_list = []
 
-        use_cols = [self.step_id_col] + volt_cols
-        result_df = result_df[[c for c in use_cols if c in result_df.columns]]
-        df = self.pivot_steps_to_columns_and_merge(cell_df, result_df)
+        for p in pack_codes:
+            pack_result_df = vehicle_result_df[vehicle_result_df['pack_code'] == p].copy()
+            use_cols = [self.step_id_col] + volt_cols
+            pack_result_df = pack_result_df[[c for c in use_cols if c in pack_result_df.columns]]
 
-        return df
+            pack_cell_df = vehicle_cell_df[vehicle_cell_df['pack_code'] == p].copy().reset_index(drop=True)
+            if self.cell_index_col not in pack_cell_df.columns:
+                pack_cell_df.insert(0, self.cell_index_col, np.arange(1, len(pack_cell_df) + 1))
+
+            pack_score_df = self.pivot_steps_to_columns_and_merge(pack_cell_df, pack_result_df, n_cells)
+            pack_score_df_list.append(pack_score_df)
+
+        final_df = pd.concat(pack_score_df_list, axis=0, ignore_index=True)
+
+        return final_df
 
     def pivot_steps_to_columns_and_merge(self,
                                          df_cell: pd.DataFrame,
-                                         df_result: pd.DataFrame) -> pd.DataFrame:
+                                         df_result: pd.DataFrame,
+                                         n_cells: int) -> pd.DataFrame:
 
-        volt_cols = [c for c in df_result.columns if c and c.startswith(self.volt_prefix)]
+        volt_cols = [f'bms_cellvolt{i + 1}' for i in range(n_cells)]
         id_cols = [c for c in df_result.columns if c not in volt_cols]
 
         if not volt_cols:
-            self.logger.debug("No voltage columns found with prefix '%s' in df_result; returning df_cell as-is", self.volt_prefix)
+            self.logger.debug("No voltage columns found with prefix '%s' in df_result; returning df_cell as-is",
+                              self.volt_prefix)
             return df_cell
 
         df2_long = df_result.melt(id_vars=id_cols, value_vars=volt_cols,
@@ -118,7 +174,8 @@ class PackFrameBuilder:
         df2_long['cell_index'] = df2_long['bms_col'].astype(str).apply(_extract_index)
         missing_idx_mask = df2_long['cell_index'].isna()
         if missing_idx_mask.any():
-            self.logger.warning("Some bms_col names did not contain an integer index; dropping %d rows", missing_idx_mask.sum())
+            self.logger.warning("Some bms_col names did not contain an integer index; dropping %d rows",
+                                missing_idx_mask.sum())
             df2_long = df2_long[~missing_idx_mask].copy()
 
         if len(id_cols) == 1:
@@ -151,7 +208,7 @@ def build_pack_features(
         group_col: str = "pack_code",
         numeric_cols: Optional[List[str]] = None,
         step_prefix: str = "step_",
-        step_range_for_inputs: range = range(1, 10),  # 1..9 inclusive
+        step_range_for_inputs: Optional[List[str]] = None,  # 1..9 inclusive
         stats: Optional[List[str]] = None,
         include_counts: bool = True
 ) -> pd.DataFrame:

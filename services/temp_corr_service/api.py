@@ -12,37 +12,6 @@ logger = logging.getLogger(__name__)
 def _get_factory() -> ServiceFactory:
     return get_service_factory()
 
-# @router.post("/pack-temp-corr", response_model=PackCorrResponse)
-# def pack_temp_corr(payload: PackQuery, factory: ServiceFactory = Depends(_get_factory)):
-#     """
-#     Router 层：通过 factory 获取/创建 TempService 并执行 pack_temp_corr。
-#     注意：factory.create 返回的是 TempService 实例（请在 main.py 中用 register 注册）。
-#     """
-#     try:
-#         logger.info("Received /temp/pack-temp-corr request: %s", payload.dict())
-#     except Exception:
-#         logger.info("Received /temp/pack-temp-corr request: vehicle_code=%s step_id=%s",
-#                     getattr(payload, "vehicle_code", None), getattr(payload, "step_id", None))
-#
-#     try:
-#         svc = factory.create("temp")
-#     except KeyError:
-#         raise HTTPException(status_code=500, detail="temp service 未注册")
-#
-#     try:
-#         res = svc.pack_temp_corr(payload.vehicle_code, payload.step_id)
-#     except ValueError as e:
-#         raise HTTPException(status_code=404, detail=str(e))
-#     except RuntimeError as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"内部错误: {e}")
-#
-#     logger.info("pack-temp-corr success: vehicle_code=%s step_id=%s", payload.vehicle_code, payload.step_id)
-#
-#     return PackCorrResponse(**res)
-
-
 @router.post("/pack-temp-corr", response_model=PackCorrResponse)
 def pack_temp_corr(payload: PackQuery, factory: ServiceFactory = Depends(_get_factory)):
     try:

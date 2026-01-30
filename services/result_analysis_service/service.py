@@ -125,11 +125,6 @@ class ResultService(BaseService):
             discharge_capacity_list.append(sub['discharge_capacity'].values)
             pack_dfs[p] = sub
 
-        # charge_energy_list = np.array(charge_energy_list)
-        # charge_capacity_list = np.array(charge_capacity_list)
-        # discharge_energy_list = np.array(discharge_energy_list)
-        # discharge_capacity_list = np.array(discharge_capacity_list)
-
         lengths = [len(g) for g in pack_dfs.values()]
         min_len = min(lengths) if lengths else 0
         if min_len == 0:
@@ -164,73 +159,39 @@ class ResultService(BaseService):
                 _result = {
                     "stepId": step_id,
                     "stepName": step_name,
-                    "resultDataList": {f"bmsCellvolt{i + 1}": 0.0 for i in range(len(volt_cols))}
+                    "resultDataList": {f"bmsCellvolt{i + 1}": None for i in range(len(volt_cols))},
+                    "voltDiff": None
                 }
             else:
                 volt_data = volt_df[volt_df['step_id'] == step_id][volt_cols].iloc[0].values
-                volt_dict = {f"bmsCellvolt{i + 1}": round(volt_data[i], 3) for i in range(len(volt_data))}
+                volt_dict = {
+                            f"bmsCellvolt{i + 1}": (None if pd.isna(v) else round(float(v), 3))
+                            for i, v in enumerate(volt_data)
+                            }
                 _result = {
                     "stepId": step_id,
                     "stepName": step_name,
                     "resultDataList": volt_dict,
-                    "voltDiff": round(np.max(volt_data) - np.min(volt_data), 3)
+                    "voltDiff": round(np.max(volt_data[volt_data != None]) - np.min(volt_data[volt_data != None]), 3)
                 }
             result_list.append(_result)
-        # if len(df) < 5:
-        #     raise HTTPException(status_code=404, detail="数据库中结果数据不完整")
-
-        # volt_cols = [c for c in df.columns if c and c.startswith("bms_cellvolt")]
-        # stepName_list = ['测前电压', '充电末端动态电压', '充电后静态电压', '放电末端动态电压', '放电后静态电压']
-        # cell_map_df = pd.read_csv('services/result_analysis_service/data/cell_position_map.csv')
-        # result_list = []
-        #
-        # for i, id in enumerate(['1', '8', '9', '14', '15']):
-        #     if df[df['step_id'] == id].empty:
-        #         _result = {
-        #             "stepId": id,
-        #             "stepName": stepName_list[i],
-        #             "resultDataList": {f"bmsCellvolt{i + 1}": 0.0 for i in range(102)}
-        #         }
-        #     else:
-        #         volt_data = df[df['step_id'] == id][volt_cols].iloc[0].values
-        #         volt_df = pd.DataFrame({
-        #             'cell_index': range(1, len(volt_cols) + 1),
-        #             'cell_volt': volt_data
-        #         })
-        #         volt_df = pd.merge(volt_df, cell_map_df, how='left', left_on='cell_index', right_on='cell_index')
-        #         vals = volt_df.sort_values(['module_in_pack', 'cell_in_module'])['cell_volt'].values
-        #         volt_dict = {f"bmsCellvolt{i + 1}": round(vals[i], 3) for i in range(102)}
-        #         _result = {
-        #             "stepId": id,
-        #             "stepName": stepName_list[i],
-        #             "resultDataList": volt_dict
-        #         }
-        #     result_list.append(_result)
 
         return {'results': result_list}
 
-
 class ResultPredictService(BaseService):
-    """
-    TempService: 提供 pack-temp-corr 功能的 service 类。
-    推荐在注册时把 engine 与列名通过构造器注入，例如：
-        factory.register("temp", lambda **kw: TempService(engine=engine, table='your_table', temp_cols_per_pack=[...]))
-    """
+
     def __init__(self, settings=None, db_client=None):
         self.db_client = db_client
         self._ready = False
+        self.frame_builder = PackFrameBuilder()
+        self.cell_feature = ['capacity', 'ocv3', 'ocv4', 'acr3', 'acr4', 'k_value', 'cell_thickness', 'weight']
+        self.test_step_feature = ['1']
+        self.target_name = ['Discharge_Dynamic_Voltage', 'Discharge_Static_Voltage', 'Charge_Dynamic_Voltage', 'Charge_Static_Voltage']
         self.result_table = 'jz2_pack_result_data'
         self.cell_table = 'jz2_pack_cell_data'
-        self.cell_map_df = pd.read_csv('services/result_analysis_service/data/cell_position_map.csv')
-        self.frame_builder = PackFrameBuilder()
-        self.input_feature = settings.MODEL_CONFIG.get('input_feature')
-        self.input_feature_num = len(self.input_feature)
-        self.cell_num = settings.PACK_CONFIG.get('CELLS_PER_PHYSICAL_PACK')
+        self.model_name = 'Catboost'
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.target_name = settings.MODEL_CONFIG.get('target_name', ['Discharge_Dynamic_Voltage', 'Discharge_Static_Voltage'])
-        self.model_name = settings.MODEL_CONFIG.get('model_name', 'Catboost')
         self.model_holder = ModelHolder(settings=settings, device=self.device, target_name=self.target_name)
-
 
     async def startup(self) -> None:
         self._ready = True
@@ -241,143 +202,34 @@ class ResultPredictService(BaseService):
     def info(self) -> Dict[str, Any]:
         return {"name": "ResultPredictService", "ready": self._ready}
 
-    def fetch_cell_data(self, pack_code: str) -> pd.DataFrame:
-
-        sql = text(f"""
-                    SELECT *
-                    FROM `{self.cell_table}`
-                    WHERE pack_code = :pack_code
-                    """)
-        try:
-            df = self.db_client.read_sql(sql, params={"pack_code": pack_code})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"数据库电芯数据查询失败: {e}")
-
-        df = df.sort_values('ocv4_time').drop_duplicates(
-            subset=['pack_code', 'module_code', 'cell_code'], keep='last')
-
-        if not DataValidator.is_valid_pack_cell_df(df):
-            raise HTTPException(status_code=404, detail="数据库中电芯数据不完整")
-
-        return df
-
-    def fetch_result_data(self, pack_code: str) -> pd.DataFrame:
-        sql = text(f"""
-                    SELECT *
-                    FROM `{self.result_table}`
-                    WHERE pack_code = :pack_code
-                    """)
-        try:
-            df = self.db_client.read_sql(sql, params={"pack_code": pack_code})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"数据库结果数据查询失败: {e}")
-
-        df = df.sort_values(["acquire_time"]).drop_duplicates(subset=['step_id'], keep='last')
-
-        if not DataValidator.is_valid_pack_result_df(df):
-            raise HTTPException(status_code=404, detail="数据库中结果数据不完整")
-
-        return df
-
-    def fetch_input_data(self, pack_code: str):
-        if self.db_client is None:
-            raise HTTPException(status_code=500, detail="数据库引擎创建失败")
-
-        cell_df = self.fetch_cell_data(pack_code)
-        result_df = self.fetch_result_data(pack_code)
-
-        cell_df = pd.merge(cell_df,
-                           self.cell_map_df,
-                           on=['module_in_pack', 'cell_in_module'],
-                           how='inner')
-
-        df = self.frame_builder.build_frames(cell_df, result_df)
-        return df
-
-    def cal_diff_data(self, df):
-        diff_result = {}
-        if 'step_1_volt' in df.columns:
-            diff_result.update({
-                "测前压差": round(df['step_1_volt'].max() - df['step_1_volt'].min(), 3)
-            })
-        else:
-            diff_result.update({
-                "测前压差": 0
-            })
-        if 'step_8_volt' in df.columns:
-            diff_result.update({
-                "充电末端动态压差": round(df['step_8_volt'].max() - df['step_8_volt'].min(), 3)
-            })
-        else:
-            diff_result.update({
-                "充电末端静态压差": 0
-            })
-        if 'step_9_volt' in df.columns:
-            diff_result.update({
-                "充电后静态压差": round(df['step_9_volt'].max() - df['step_9_volt'].min(), 3)
-            })
-        else:
-            diff_result.update({
-                "充电后静态压差": 0
-            })
-        if 'step_14_volt' in df.columns:
-            diff_result.update({
-                "放电末端动态压差": round(df['step_14_volt'].max() - df['step_14_volt'].min(), 3)
-            })
-        else:
-            diff_result.update({
-                "放电末端动态压差": 0
-            })
-        if 'step_15_volt' in df.columns:
-            diff_result.update({
-                "放电后静态压差": round(df['step_15_volt'].max() - df['step_15_volt'].min(), 3)
-            })
-        else:
-            diff_result.update({
-                "放电后静态压差": 0
-            })
-
-        return diff_result
-
-    def pack_result_predict(self, pack_code: str):
-
-        input_df = self.fetch_input_data(pack_code)
-
-        diff_result = self.cal_diff_data(input_df)
-
-        if input_df[self.input_feature].isnull().any().any():
-            diff_result.update({
-                "放电末端动态压差预测值": 0,
-                "放电后静态压差预测值": 0
-            })
-            return diff_result
+    def pack_result_predict(self, pack_codes: List[str]):
+        input_df = self.fetch_input_data(pack_codes)
+        pred_result = {}
 
         if self.model_name == 'Catboost':
-            target_name_map = {
-                'Discharge_Dynamic_Voltage': '放电末端动态压差预测值',
-                'Discharge_Static_Voltage': '放电后静态压差预测值'
-            }
+
             input_tree_df = build_pack_features(
                 input_df,
-                group_col='pack_code',
-                numeric_cols=None,
-                step_range_for_inputs=range(1, 10),
+                group_col='vehicle_code',
+                numeric_cols=self.cell_feature,
+                step_range_for_inputs= self.test_step_feature,
                 stats=['mean', 'std', 'min', 'max', 'median', 'q25', 'q75', 'range'],
                 include_counts=True
             )
+
             numeric_cols = input_tree_df.select_dtypes(include=[np.number]).columns.tolist()
             for target in self.target_name:
                 try:
                     model, model_dir = self.model_holder.load_model(target)
                 except Exception as e:
-                    diff_result.update({
-                        f"{target_name_map[target]}": 0
+                    pred_result.update({
+                        f"{target}": 0
                     })
                     continue
 
                 y_pred = model.predict(input_tree_df[numeric_cols])
-                diff_result.update({
-                    f"{target_name_map[target]}": round(y_pred[0], 3)
+                pred_result.update({
+                    f"{target}": round(y_pred[0], 3)
                 })
 
         else:
@@ -389,7 +241,7 @@ class ResultPredictService(BaseService):
 
             X_flat = input_vals.reshape(-1, self.input_feature_num)  # (cell_num, feature)
 
-            results = {"pack_code": pack_code, "predictions": {}}
+            results = {"pack_code": pack_codes, "predictions": {}}
 
             for target in self.target_idxs:
                 try:
@@ -421,14 +273,75 @@ class ResultPredictService(BaseService):
                         pred_inv_flat = pred_flat
 
                 pred_final = pred_inv_flat.reshape(1, self.cell_num, -1)  # (1, cell_num, out_dim)
-                pred_list = pred_final.tolist()
 
-                results["predictions"][target] = {
-                    "pred": pred_list,
-                    "model_dir": model_dir
-                }
+        return pred_result
 
-        return diff_result
+
+    def fetch_cell_data(self, pack_codes: List[str]) -> pd.DataFrame:
+        sql = text(f"""
+                            SELECT *
+                            FROM `{self.cell_table}`
+                            WHERE pack_code IN :pack_codes
+                            """)
+        try:
+            df = self.db_client.read_sql(sql, params={"pack_codes": pack_codes})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"数据库电芯数据查询失败: {e}")
+
+        df = df.sort_values('ocv4_time').drop_duplicates(
+            subset=['pack_code', 'module_code', 'cell_code'], keep='last')
+        df = df.query("cell_code.notna() and cell_code != ''")
+
+        if not DataValidator.is_valid_pack_cell_df(df):
+            raise HTTPException(status_code=404, detail="数据库中电芯数据不完整")
+
+        return df
+
+    def fetch_result_data(self, pack_codes: List[str]) -> pd.DataFrame:
+        sql = text(f"""
+                    SELECT *
+                    FROM `{self.result_table}`
+                    WHERE pack_code IN :pack_codes
+                    AND step_id IN :step_ids
+                    """)
+        try:
+            df = self.db_client.read_sql(sql, params={"pack_codes": pack_codes, "step_ids": self.test_step_feature})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"数据库结果数据查询失败: {e}")
+
+        df = df.sort_values(["acquire_time"]).drop_duplicates(subset=['pack_code', 'step_id'], keep='last')
+
+        if not DataValidator.is_valid_pack_result_df(df, self.test_step_feature):
+            raise HTTPException(status_code=404, detail="数据库中结果数据不完整")
+
+        return df
+
+    def fetch_input_data(self, pack_codes: List[str]):
+
+        cell_df = self.fetch_cell_data(pack_codes)
+        result_df = self.fetch_result_data(pack_codes)
+
+        pack_codes, flag = DataValidator.is_valid_cell_result_df(result_df, cell_df)
+
+        if not flag:
+            raise HTTPException(status_code=404, detail="当前电测数据和电芯数据无法匹配")
+
+        n_cells = DataValidator.extract_series_count(result_df.iloc[0]['vehicle_to_pack_num'])
+
+        if n_cells != 102 and n_cells != 96:
+            raise HTTPException(status_code=404, detail="电芯数目解析错误")
+
+        cell_map_df = pd.read_csv('services/result_analysis_service/data/cell_position_map.csv') if n_cells == 102 else pd.read_csv(
+            'services/result_analysis_service/data/cell_position_map_96.csv')
+
+        cell_df = pd.merge(cell_df,
+                           cell_map_df,
+                           on=['module_in_pack', 'cell_in_module'],
+                           how='left')
+
+        df = self.frame_builder.build_frames(result_df, cell_df, pack_codes, n_cells)
+        return df
+
 
 
 
