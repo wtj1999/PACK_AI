@@ -5,6 +5,8 @@ from services.temp_corr_service import register as register_temp, router as temp
 from services.dcr_analysis_service import register as register_dcr, router as dcr_router
 from services.result_analysis_service import register as register_result, router as result_router
 from services.process_analysis_service import register as register_process, router as process_router
+from services.pack_info_service import register as register_packinfo, router as packinfo_router
+from services.cell_info_service import register as register_cellinfo, router as cellinfo_router
 from core.config import get_settings
 from core.logging import setup_logging
 
@@ -19,6 +21,8 @@ app.include_router(temp_router, prefix="/temp", tags=["temp"])
 app.include_router(dcr_router, prefix="/dcr", tags=["dcr"])
 app.include_router(result_router, prefix="/result", tags=["result"])
 app.include_router(process_router, prefix="/process", tags=["process"])
+app.include_router(packinfo_router, prefix="/packinfo", tags=["packinfo"])
+app.include_router(cellinfo_router, prefix="/cellinfo", tags=["cellinfo"])
 
 
 @app.on_event("startup")
@@ -28,6 +32,8 @@ async def startup():
     register_dcr(factory, settings=settings, db_client=app.state.db_client, **service_kwargs)
     register_result(factory, settings=settings, db_client=app.state.db_client, **service_kwargs)
     register_process(factory, settings=settings, db_client=app.state.db_client, **service_kwargs)
+    register_packinfo(factory, settings=settings, db_client=app.state.db_client, **service_kwargs)
+    register_cellinfo(factory, settings=settings, db_client=app.state.db_client, **service_kwargs)
 
     await factory.startup_all()
 

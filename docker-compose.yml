@@ -3,12 +3,15 @@ version: "3.8"
 
 services:
   app:
-    build: .
-    image: pack_ai:latest
-    container_name: pack_ai
+    build:
+      context: .
+      network: host
+    image: pack_ai_test:latest
+    container_name: pack_ai_test
     restart: always
-    ports:
-      - "8001:8000"
+    network_mode: host
+#    ports:
+#      - "8001:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
       interval: 30s

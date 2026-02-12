@@ -168,10 +168,17 @@ class ResultService(BaseService):
                             f"bmsCellvolt{i + 1}": (None if pd.isna(v) else round(float(v), 3))
                             for i, v in enumerate(volt_data)
                             }
+                volt_list = [
+                    {
+                        'bmsCellindex': i + 1,
+                        'bmsCellvolt': (None if pd.isna(v) else round(float(v), 3))
+                    }
+                    for i, v in enumerate(volt_data)
+                ]
                 _result = {
                     "stepId": step_id,
                     "stepName": step_name,
-                    "resultDataList": volt_dict,
+                    "resultDataList": volt_list,
                     "voltDiff": round(np.max(volt_data[volt_data != None]) - np.min(volt_data[volt_data != None]), 3)
                 }
             result_list.append(_result)

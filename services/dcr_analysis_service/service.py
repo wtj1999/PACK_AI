@@ -37,7 +37,7 @@ class DcrService(BaseService):
         outlier_idxs = []
         if std > 0:
             z = (vals - median) / std
-            outlier_idxs = np.where(z > 5)[0].tolist()
+            outlier_idxs = np.where(z > 3)[0].tolist()
 
         return outlier_idxs
 
@@ -101,10 +101,18 @@ class DcrService(BaseService):
 
         dcr_list = pd.to_numeric(dcr_df['dcr'], errors='coerce')
 
-        cell_dcr_dict = {
-            f"cellDcr{i + 1}": (None if pd.isna(v) else round(float(v), 3))
+        # cell_dcr_dict = {
+        #     f"cellDcr{i + 1}": (None if pd.isna(v) else round(float(v), 3))
+        #     for i, v in enumerate(dcr_list)
+        # }
+
+        cell_dcr_list = [
+            {
+                'bmsCellindex': i + 1,
+                'bmsCelldcr': (None if pd.isna(v) else round(float(v), 3))
+            }
             for i, v in enumerate(dcr_list)
-        }
+        ]
 
         cell_sql = text(f"""
                         SELECT pack_code, cell_code, ocv4_time, module_in_pack, cell_in_module, capacity, ocv3, ocv4, acr3, acr4, k_value, cell_thickness, weight
@@ -124,7 +132,7 @@ class DcrService(BaseService):
         if len(cell_df) != n_cells * len(pack_codes):
             return {
             "dcr_anomaly_cell_code": [],
-            "dcr_list": cell_dcr_dict,
+            "dcr_list": cell_dcr_list,
             "correlationAnalysis": []
             }
         if n_cells == 102:
@@ -157,7 +165,7 @@ class DcrService(BaseService):
 
         result = {
             "dcr_anomaly_cell_code": records,
-            "dcr_list": cell_dcr_dict,
+            "dcr_list": cell_dcr_list,
             "correlationAnalysis": [
                 {
                     "sourceParam": "DCR",

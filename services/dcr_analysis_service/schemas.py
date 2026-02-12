@@ -17,6 +17,11 @@ class CorrelationItem(BaseModel):
         None, description="Pearson 相关系数（四舍五入后的小数）；不可计算时为 null"
     )
 
+class CellDcrItem(BaseModel):
+    bmsCellindex: int = Field(..., description="电芯索引，从1开始")
+    bmsCelldcr: Optional[float] = Field(
+        None, description="电芯dcr（float），缺失时为 null"
+    )
 
 class PackDcrResponse(BaseModel):
     """
@@ -29,9 +34,9 @@ class PackDcrResponse(BaseModel):
         default_factory=list,
         description="检测到的 DCR 异常电芯（list of {pack_code, cell_code}）"
     )
-    dcr_list: Dict[str, Optional[float]] = Field(
-        default_factory=dict,
-        description="按顺序展开的 DCR 列表，键如 'cellDcr1'...'cellDcrN'，值为浮点数或 null（表示缺失）"
+    dcr_list: List[CellDcrItem] = Field(
+        default_factory=list,
+        description="按顺序的电芯dcr列表，每项包含 bmsCellindex 与 bmsCelldcr。",
     )
     correlationAnalysis: List[CorrelationItem] = Field(
         default_factory=list,

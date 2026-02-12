@@ -669,7 +669,7 @@ class ProcessDisplayService(BaseService):
 
             for _, row in pk_df.iterrows():
                 try:
-                    t_key = pd.Timestamp(row["acquire_time"]).isoformat()
+                    t_key = str(pd.Timestamp(row["acquire_time"]))#.isoformat()
                 except Exception:
                     t_key = str(row["acquire_time"])
 
@@ -753,6 +753,29 @@ class ProcessDisplayService(BaseService):
                 volt_diff_by_time[t] = None
             else:
                 volt_diff_by_time[t] = float(round(vmax - vmin, 3))
+
+        volt_sum_list = [{"time": t, "volt_sum": volt_sum_by_time.get(t, None)} for t in all_times_keys]
+        temp_min_list = [{"time": t, "temp_min": temp_min_by_time.get(t, None)} for t in all_times_keys]
+        volt_diff_list = [{"time": t, "volt_diff": volt_diff_by_time.get(t, None)} for t in all_times_keys]
+        charge_energy_list = [{"time": t, "charge_energy": charge_energy_by_time.get(t, None)} for t in all_times_keys]
+        discharge_energy_list = [{"time": t, "discharge_energy": discharge_energy_by_time.get(t, None)} for t in
+                                 all_times_keys]
+        charge_capacity_list = [{"time": t, "charge_capacity": charge_capacity_by_time.get(t, None)} for t in
+                                all_times_keys]
+        discharge_capacity_list = [{"time": t, "discharge_capacity": discharge_capacity_by_time.get(t, None)} for t in
+                                   all_times_keys]
+        step_name_list = [{"time": t, "step_name": step_name_by_time.get(t, None)} for t in all_times_keys]
+
+        return {
+            "volt_sum_list": volt_sum_list,
+            "temp_min_list": temp_min_list,
+            "volt_diff_list": volt_diff_list,
+            "charge_energy_list": charge_energy_list,
+            "discharge_energy_list": discharge_energy_list,
+            "charge_capacity_list": charge_capacity_list,
+            "discharge_capacity_list": discharge_capacity_list,
+            "step_name_list": step_name_list
+        }
 
         return {
             "volt_sum_by_time": volt_sum_by_time,

@@ -5,6 +5,11 @@ from typing import List, Optional, Dict, Any
 class PackQuery(BaseModel):
     pack_code: List = Field(..., description="PACK编号")
 
+class CellVoltItem(BaseModel):
+    bmsCellindex: int = Field(..., description="电芯索引，从1开始")
+    bmsCellvolt: Optional[float] = Field(
+        None, description="电芯电压（float），缺失时为 null"
+    )
 
 class StepResultItem(BaseModel):
     stepId: Optional[Any] = Field(
@@ -15,9 +20,9 @@ class StepResultItem(BaseModel):
         None,
         description="步骤名称，例如 '恒流充电'，若未知则为 null",
     )
-    resultDataList: Dict[str, Optional[float]] = Field(
-        default_factory=dict,
-        description="键为 bmsCellvoltN 的字典，值为对应电压（float），缺失时为 null",
+    resultDataList: List[CellVoltItem] = Field(
+        default_factory=list,
+        description="按顺序的电芯电压列表，每项包含 bmsCellindex 与 bmsCellvolt。",
     )
     voltDiff: Optional[float] = Field(
         None,
