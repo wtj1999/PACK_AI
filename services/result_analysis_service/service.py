@@ -38,14 +38,10 @@ class ResultService(BaseService):
 
     def normalize_label(self, s: str) -> str:
         COMMON_NOISE_PATTERNS = [
-            r"\b测试\b",  # 测试
-            r"\bDCR\b",  # DCR
-            r"\b\d+P\d+S\b",  # 1P102S, etc.
-            r"\b\d+P\b",  # 1P
-            r"\bP\d+S\b",  # P102S
-            r"\b1P102S\b",  # explicit
-            r"[()（）\-_/]",  # 括号和连接符
-            r"\s+",  # 多余空白
+            r"\b测试\b",              # 测试
+            r"\bDCR\b",               # DCR
+            r"[()（）\-\_/]",          # 括号和连接符
+            r"\s+",                   # 多余空白
         ]
 
         _noise_re = re.compile("|".join(COMMON_NOISE_PATTERNS), flags=re.IGNORECASE)
@@ -53,7 +49,13 @@ class ResultService(BaseService):
         if s is None:
             return ""
         s = str(s)
+        # 先把常见的包结构（如 1P96S、1P、P96S 等）单独去掉（以避免它影响规范化匹配）
+        s = re.sub(r"(?i)\b\d+\s*[pP]\s*\d+\s*[sS]\b", " ", s)   # 1P96S, 2P48S ...
+        s = re.sub(r"(?i)\b\d+\s*[pP]\b", " ", s)               # 1P, 2P ...
+        s = re.sub(r"(?i)\b[pP]\s*\d+\s*[sS]\b", " ", s)        # P96S (if written as P96S)
+        # 然后应用其它噪声规则
         s = _noise_re.sub(" ", s)
+        # 只允许中文/英文/数字为主体字符，其它替换为空格
         s = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]+", " ", s)
         s = s.strip().lower()
         s = re.sub(r"\s+", " ", s)
@@ -62,28 +64,68 @@ class ResultService(BaseService):
     def find_best_test_config_key(self,
                                   label: str,
                                   config: Dict[str, Dict],
-                                  fuzzy_threshold: float = 0.8
+                                  fuzzy_threshold: float = 0.6
                                   ) -> Optional[Tuple[str, Dict]]:
+        """
+        在 config 的 keys 中找到最匹配 label 的 key，优先按包含/相等匹配，
+        若找不到再用 difflib 相似度匹配（阈值 fuzzy_threshold）。
+        """
         if not label:
             return None
 
+        # 对 label 做两种规范化路径：1) 标准规范化（已移除 pack-size） 2) 原始规范化（不移除 pack-size）
         label_norm = self.normalize_label(label)
+
+        # 构建规范化键映射，并同时构建一个“去掉 pack-size 后”的规范化键
         norm_map = {}
+        norm_map_no_pack = {}
         for k in config.keys():
             kn = self.normalize_label(k)
             norm_map[k] = kn
+            # 同样对 key 再次去掉类似 1P96S 的后缀并规范化（以防 key 中也带这些后缀）
+            k_no_pack = re.sub(r"(?i)\b\d+\s*[pP]\s*\d+\s*[sS]\b", " ", str(k))
+            k_no_pack = re.sub(r"(?i)\b\d+\s*[pP]\b", " ", k_no_pack)
+            k_no_pack = re.sub(r"(?i)\b[pP]\s*\d+\s*[sS]\b", " ", k_no_pack)
+            norm_map_no_pack[k] = self.normalize_label(k_no_pack)
 
+        # 1) 精确等于（最优先）
+        for orig_k, kn in norm_map.items():
+            if kn and kn == label_norm:
+                return orig_k, config[orig_k]
+        # 1b) 也尝试去掉 pack-size 后的等于（以防 key 含 pack-size）
+        for orig_k, kn in norm_map_no_pack.items():
+            if kn and kn == label_norm:
+                return orig_k, config[orig_k]
+
+        # 2) 包含关系（key 包含在 label 中，或 label 包含在 key 中）
         for orig_k, kn in norm_map.items():
             if kn and kn in label_norm:
                 return orig_k, config[orig_k]
-
         for orig_k, kn in norm_map.items():
-            if label_norm and label_norm in kn:
+            if kn and label_norm in kn:
                 return orig_k, config[orig_k]
 
+        # 2b) 再尝试用去掉 pack-size 的 key 版本进行包含匹配
+        for orig_k, kn in norm_map_no_pack.items():
+            if kn and kn in label_norm:
+                return orig_k, config[orig_k]
+        for orig_k, kn in norm_map_no_pack.items():
+            if kn and label_norm in kn:
+                return orig_k, config[orig_k]
+
+        # 3) 最后使用 difflib 相似度匹配（选最高分，需超过阈值）
         best_k = None
         best_score = 0.0
         for orig_k, kn in norm_map.items():
+            if not kn:
+                continue
+            score = difflib.SequenceMatcher(None, label_norm, kn).ratio()
+            if score > best_score:
+                best_score = score
+                best_k = orig_k
+
+        # 也检查 no_pack 版本以防 key 带 pack-size 导致相似度偏低
+        for orig_k, kn in norm_map_no_pack.items():
             if not kn:
                 continue
             score = difflib.SequenceMatcher(None, label_norm, kn).ratio()
@@ -159,7 +201,13 @@ class ResultService(BaseService):
                 _result = {
                     "stepId": step_id,
                     "stepName": step_name,
-                    "resultDataList": {f"bmsCellvolt{i + 1}": None for i in range(len(volt_cols))},
+                    "resultDataList": [
+                    {
+                        'bmsCellindex': i + 1,
+                        'bmsCellvolt': None
+                    }
+                    for i, v in enumerate(volt_cols)
+                ],
                     "voltDiff": None
                 }
             else:

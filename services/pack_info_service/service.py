@@ -69,7 +69,7 @@ class PackinfoService(BaseService):
                 params["end_time"] = end_time
 
         # elecProcessConfig filter (only when explicitly provided, allow 0/'' if needed)
-        if elec_config is not None:
+        if elec_config:
             conditions.append("vehicle_to_pack_num = :elec_config")
             params["elec_config"] = elec_config
 
