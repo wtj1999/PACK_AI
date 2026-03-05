@@ -64,7 +64,7 @@ class ResultService(BaseService):
     def find_best_test_config_key(self,
                                   label: str,
                                   config: Dict[str, Dict],
-                                  fuzzy_threshold: float = 0.6
+                                  fuzzy_threshold: float = 0.8
                                   ) -> Optional[Tuple[str, Dict]]:
         """
         在 config 的 keys 中找到最匹配 label 的 key，优先按包含/相等匹配，
@@ -153,6 +153,12 @@ class ResultService(BaseService):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"数据库查询失败: {e}")
 
+        res = self.find_best_test_config_key(df['vehicle_to_pack_num'].iloc[0], self.test_step_map)
+        test_step_info = res[1] if res else None
+
+        if not test_step_info:
+            raise HTTPException(status_code=500, detail="测试步骤信息未配置")
+
         pack_dfs: Dict[str, pd.DataFrame] = {}
         charge_energy_list = []
         discharge_energy_list = []
@@ -188,12 +194,6 @@ class ResultService(BaseService):
 
         volt_cols = [col for col in volt_df.columns if col and col.startswith("BMS_BattVolt")]
 
-        res = self.find_best_test_config_key(df['vehicle_to_pack_num'].iloc[0], self.test_step_map)
-        test_step_info = res[1] if res else None
-
-        if not test_step_info:
-            raise HTTPException(status_code=500, detail="测试步骤信息未配置")
-
         result_list = []
 
         for step_id, step_name in test_step_info.items():
@@ -212,10 +212,7 @@ class ResultService(BaseService):
                 }
             else:
                 volt_data = volt_df[volt_df['step_id'] == step_id][volt_cols].iloc[0].values
-                volt_dict = {
-                            f"bmsCellvolt{i + 1}": (None if pd.isna(v) else round(float(v), 3))
-                            for i, v in enumerate(volt_data)
-                            }
+                volt_data = volt_data[volt_data != None]
                 volt_list = [
                     {
                         'bmsCellindex': i + 1,

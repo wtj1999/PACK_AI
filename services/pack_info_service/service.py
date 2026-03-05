@@ -95,7 +95,17 @@ class PackinfoService(BaseService):
             if pd.isna(vehicle_code):
                 continue
 
-            pack_list = sorted([str(x) for x in g['pack_code'].dropna().unique()])
+            # pack_list = sorted([str(x) for x in g['pack_code'].dropna().unique()])
+            _vals = [str(x) for x in g['pack_code'].dropna().unique()]
+
+            def _last6_key(s: str):
+                k = s[-6:]
+                try:
+                    return (0, int(k))
+                except Exception:
+                    return (1, k)
+
+            pack_list = sorted(_vals, key=_last6_key)
 
             elec_str = [v for v in g['vehicle_to_pack_num'].dropna().unique()][0]
             date_str = str([v for v in g['acquire_time'].dropna().unique()][0])

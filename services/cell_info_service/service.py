@@ -69,6 +69,7 @@ class CellinfoService(BaseService):
 
         cell_df = pd.merge(cell_df, cell_map_df, how='left', on=['module_in_pack', 'cell_in_module'])
         cell_df = cell_df.sort_values(by=['pack_code', 'cell_index'])
+        cell_df['cell_index'] = [i for i in range(1, len(cell_df) + 1)]
 
         out_cols = [
             'pack_code', 'cell_code', 'module_in_pack', 'cell_in_module',
